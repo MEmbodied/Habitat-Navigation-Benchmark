@@ -33,12 +33,13 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
             result = json_numpy.loads(result)
             
         
-        # 3. 获取 delta poses (这是 Server 现在返回的内容)
-        dp_actions_np = result["dp_actions"]
+        # 3. 获取 delta poses 
+        dp_actions = result["action"]
         
-        # 转换回 tensor (因为 traj_to_actions_Gr00t 可能预期 tensor 输入，或者保持 numpy)
-        # 假设 traj_to_actions_Gr00t 能处理 Tensor:
-        dp_actions = torch.from_numpy(dp_actions_np)
+        # dp_actions = torch.from_numpy(dp_actions_np)
+
+        # ！！！如果模型输出结果不匹配比如尺寸归一化等要处理的话改这个函数就行，没有就算了
+        dp_actions = gr00t_output_to_dp_actions(dp_actions)
 
         # 4. 在此处进行 "轨迹 -> 离散动作" 的转换
         # 这样逻辑就回到了 Client 端
@@ -49,8 +50,7 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
             actions = [1]
         
         return {
-            "actions": actions,
-            "stop": result.get("stop", False) # 顺便把 server 传回来的 stop 也带上
+            "actions": actions
         }
 
 def traj_to_actions_Gr00t(dp_actions,use_discrate_action=True):
@@ -127,3 +127,47 @@ def traj_to_actions_Gr00t(dp_actions,use_discrate_action=True):
         return actions
     else:
         return trajectory
+    
+def gr00t_output_to_dp_actions(gr00t_out):
+        """
+        把 Gr00t 输出转换为 traj_to_actions_Gr00t 需要的格式。
+
+        支持以下 gr00t_out 形式：
+        - numpy array shape (T, 4)  # 单序列
+        - numpy array shape (1, T, 4)  # batch=1
+        - torch tensor 同上
+
+        Gr00t 输出列 assumed: [dx, dy, dz, dyaw_degrees]
+        返回: torch.Tensor shape (1, T, 3) dtype=float32, last dim = [dx, dy, dyaw_rad*12]
+        """
+        # 转 numpy / torch 兼容
+        if isinstance(gr00t_out, torch.Tensor):
+            arr = gr00t_out.detach().cpu().numpy()
+        else:
+            arr = np.asarray(gr00t_out)
+
+        # 支持 (T,4) 或 (1,T,4) 或 (B,T,4)
+        if arr.ndim == 2 and arr.shape[1] == 4:
+            arr = arr[None, :, :]  # -> (1, T, 4)
+        elif arr.ndim == 3 and arr.shape[2] == 4:
+            pass
+        else:
+            raise ValueError(f"Unsupported gr00t_out shape: {arr.shape}, expected (T,4) or (1,T,4) or (B,T,4)")
+
+        # 取 (dx, dy, dyaw)
+        # 列索引假设： 0=dx, 1=dy, 2=dz (unused), 3=dyaw (单位：度)
+        dx = arr[:, :, 0].astype(np.float32)
+        dy = arr[:, :, 1].astype(np.float32)
+        dyaw_deg = arr[:, :, 3].astype(np.float32)
+
+        # deg -> rad
+        dyaw_rad = np.deg2rad(dyaw_deg)
+
+        # 根据之前讨论，把 yaw 放大（保持和 traj_to_actions_Gr00t 里相同的放大逻辑）
+        dyaw_rad = dyaw_rad * 1.0  # base conversion
+        # 注意：traj_to_actions_Gr00t 会再做 *=12 的处理（如果你在函数里保留那一行）
+        # 此处不再重复乘 12，除非你在 traj_to_actions_Gr00t 中没有加那一行。
+
+        dp = np.stack([dx, dy, dyaw_rad], axis=-1)  # (B, T, 3)
+
+        return torch.from_numpy(dp).float()  # 返回 torch Tensor (B, T, 3)

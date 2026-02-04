@@ -1,4 +1,5 @@
 from internnav.evaluator.base import Evaluator
-from internnav.evaluator.vln_multi_evaluator import VlnMultiEvaluator
+# from internnav.evaluator.vln_multi_evaluator import VlnMultiEvaluator
 
-__all__ = ['Evaluator', 'VlnMultiEvaluator']
+__all__ = ['Evaluator']
+# __all__ = ['Evaluator', 'VlnMultiEvaluator']

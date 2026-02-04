@@ -81,72 +81,15 @@ def act(req: dict):
         dp_actions = gr00t_output
     #到这里为止拿到了gr00t模型的输出
 
-    # ！！！如果模型输出结果不匹配比如尺寸归一化等要处理的话改这个函数就行，没有就算了
-    dp_actions = gr00t_output_to_dp_actions(dp_actions)
-
-    if isinstance(dp_actions, torch.Tensor):
-        # 先转 numpy，再转 list
-        dp_actions_out = dp_actions.detach().cpu().numpy()
-    else:
-        dp_actions_out = np.asarray(dp_actions)
-
-    print("gr00t_output",type(gr00t_output))
-    print("dp_actions",type(dp_actions))
-    print("dp_actions_out",type(dp_actions_out))
-
-    STOP=0
+    # print("gr00t_output",type(gr00t_output))
+    # print("dp_actions",type(dp_actions))
+    # print("dp_actions的内容",dp_actions)
+    # print("dp_actions_out",type(dp_actions_out))
 
     response = {
-        "dp_actions": dp_actions_out,
-        "stop": STOP
+        "action": dp_actions
     }
 
     return json_numpy.dumps(response)
 
-
-
-#下面是用到的函数，按情况更改使用或新增即可
-def gr00t_output_to_dp_actions(gr00t_out):
-        """
-        把 Gr00t 输出转换为 traj_to_actions_Gr00t 需要的格式。
-
-        支持以下 gr00t_out 形式：
-        - numpy array shape (T, 4)  # 单序列
-        - numpy array shape (1, T, 4)  # batch=1
-        - torch tensor 同上
-
-        Gr00t 输出列 assumed: [dx, dy, dz, dyaw_degrees]
-        返回: torch.Tensor shape (1, T, 3) dtype=float32, last dim = [dx, dy, dyaw_rad*12]
-        """
-        # 转 numpy / torch 兼容
-        if isinstance(gr00t_out, torch.Tensor):
-            arr = gr00t_out.detach().cpu().numpy()
-        else:
-            arr = np.asarray(gr00t_out)
-
-        # 支持 (T,4) 或 (1,T,4) 或 (B,T,4)
-        if arr.ndim == 2 and arr.shape[1] == 4:
-            arr = arr[None, :, :]  # -> (1, T, 4)
-        elif arr.ndim == 3 and arr.shape[2] == 4:
-            pass
-        else:
-            raise ValueError(f"Unsupported gr00t_out shape: {arr.shape}, expected (T,4) or (1,T,4) or (B,T,4)")
-
-        # 取 (dx, dy, dyaw)
-        # 列索引假设： 0=dx, 1=dy, 2=dz (unused), 3=dyaw (单位：度)
-        dx = arr[:, :, 0].astype(np.float32)
-        dy = arr[:, :, 1].astype(np.float32)
-        dyaw_deg = arr[:, :, 3].astype(np.float32)
-
-        # deg -> rad
-        dyaw_rad = np.deg2rad(dyaw_deg)
-
-        # 根据之前讨论，把 yaw 放大（保持和 traj_to_actions_Gr00t 里相同的放大逻辑）
-        dyaw_rad = dyaw_rad * 1.0  # base conversion
-        # 注意：traj_to_actions_Gr00t 会再做 *=12 的处理（如果你在函数里保留那一行）
-        # 此处不再重复乘 12，除非你在 traj_to_actions_Gr00t 中没有加那一行。
-
-        dp = np.stack([dx, dy, dyaw_rad], axis=-1)  # (B, T, 3)
-
-        return torch.from_numpy(dp).float()  # 返回 torch Tensor (B, T, 3)
 
