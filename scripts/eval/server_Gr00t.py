@@ -19,6 +19,7 @@ uvicorn scripts.eval.server_Gr00t:app \
 from fastapi import FastAPI
 import numpy as np
 from PIL import Image
+import json_numpy
 from internnav.evaluator.gr00t_http_client import Gr00tHTTPClient   # 🔴 Gr00t 模型调用
 import torch
     
@@ -75,23 +76,34 @@ def act(req: dict):
     # 🔴 调用“真正的 Gr00t 服务”
     gr00t_output = gr00t_client.get_action(gr00t_obs)
     if isinstance(gr00t_output, dict) and "action.delta_pose" in gr00t_output:
-        delta_poses = gr00t_output["action.delta_pose"]
+        dp_actions = gr00t_output["action.delta_pose"]
     else:
-        delta_poses = gr00t_output
+        dp_actions = gr00t_output
     #到这里为止拿到了gr00t模型的输出
 
-    # ===== 🔴 Gr00t 私有 postprocess =====
-    #将输出转换成正确的格式，如删除一列(1,T,4)变为(1,T,3)或者相关数据比如角度的归一化
-    dp_actions = gr00t_output_to_dp_actions(delta_poses)
-    # print("dp_actions:",dp_actions)
+    # ！！！如果模型输出结果不匹配比如尺寸归一化等要处理的话改这个函数就行，没有就算了
+    dp_actions = gr00t_output_to_dp_actions(dp_actions)
 
-    #将转换为正确格式的输出转换为离散动作action如[1，2，0]
-    actions = traj_to_actions_Gr00t(dp_actions)
+    if isinstance(dp_actions, torch.Tensor):
+        # 先转 numpy，再转 list
+        dp_actions_out = dp_actions.detach().cpu().numpy()
+    else:
+        dp_actions_out = np.asarray(dp_actions)
 
-    # 返回 Habitat action id list
-    return {
-        "actions": actions
+    print("gr00t_output",type(gr00t_output))
+    print("dp_actions",type(dp_actions))
+    print("dp_actions_out",type(dp_actions_out))
+
+    STOP=0
+
+    response = {
+        "dp_actions": dp_actions_out,
+        "stop": STOP
     }
+
+    return json_numpy.dumps(response)
+
+
 
 #下面是用到的函数，按情况更改使用或新增即可
 def gr00t_output_to_dp_actions(gr00t_out):
@@ -138,77 +150,3 @@ def gr00t_output_to_dp_actions(gr00t_out):
 
         return torch.from_numpy(dp).float()  # 返回 torch Tensor (B, T, 3)
 
-def traj_to_actions_Gr00t(dp_actions,use_discrate_action=True):
-    def reconstruct_xy_from_delta(delta_xyt):
-        """
-        Input:
-            delta_xyt: [B, T, 3], dx, dy are position increments in global coordinates, dθ is heading difference (not used for position)
-            start_xy: [B, 2] starting point
-        Output:
-            xy: [B, T+1, 2] reconstructed global trajectory
-        """
-        start_xy = np.zeros((len(delta_xyt), 2))
-        delta_xy = delta_xyt[:, :, :2]  # Take dx, dy parts
-        cumsum_xy = np.cumsum(delta_xy, axis=1)  # [B, T, 2]
-
-        B = delta_xyt.shape[0]
-        T = delta_xyt.shape[1]
-        xy = np.zeros((B, T + 1, 2))
-        xy[:, 0] = start_xy
-        xy[:, 1:] = start_xy[:, None, :] + cumsum_xy
-
-        return xy
-
-    def trajectory_to_discrete_actions_close_to_goal(trajectory, step_size=0.25, turn_angle_deg=15, lookahead=4):
-        actions = []
-        yaw = 0.0
-        pos = trajectory[0]
-        turn_angle_rad = np.deg2rad(turn_angle_deg)
-        traj = trajectory
-        goal = trajectory[-1]
-
-        def normalize_angle(angle):
-            return (angle + np.pi) % (2 * np.pi) - np.pi
-
-        while np.linalg.norm(pos - goal) > 0.2:
-            # Find the nearest trajectory point index to current position
-            dists = np.linalg.norm(traj - pos, axis=1)
-            nearest_idx = np.argmin(dists)
-            # Look ahead a bit (not exceeding trajectory end)
-            target_idx = min(nearest_idx + lookahead, len(traj) - 1)
-            target = traj[target_idx]
-            # Target direction
-            target_dir = target - pos
-            if np.linalg.norm(target_dir) < 1e-6:
-                break
-            target_yaw = np.arctan2(target_dir[1], target_dir[0])
-            # Difference between current yaw and target yaw
-            delta_yaw = normalize_angle(target_yaw - yaw)
-            n_turns = int(round(delta_yaw / turn_angle_rad))
-            if n_turns > 0:
-                actions += [2] * n_turns
-            elif n_turns < 0:
-                actions += [3] * (-n_turns)
-            yaw = normalize_angle(yaw + n_turns * turn_angle_rad)
-
-            # Move forward one step
-            next_pos = pos + step_size * np.array([np.cos(yaw), np.sin(yaw)])
-
-            # If moving forward one step makes us farther from goal, stop
-            if np.linalg.norm(next_pos - goal) > np.linalg.norm(pos - goal):
-                break
-
-            actions.append(1)
-            pos = next_pos
-
-        return actions
-
-    # unnormalize
-    dp_actions[:, :, :2] /= 4.0
-    all_trajectory = reconstruct_xy_from_delta(dp_actions.float().cpu().numpy())
-    trajectory = np.mean(all_trajectory, axis=0)
-    if use_discrate_action:
-        actions = trajectory_to_discrete_actions_close_to_goal(trajectory)
-        return actions
-    else:
-        return trajectory

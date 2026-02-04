@@ -48,7 +48,8 @@ def parse_args():
     parser.add_argument("--mode", default='dual_system', type=str, help="inference mode: dual_system or system2")
     parser.add_argument("--local_rank", default=0, type=int, help="node rank")
     parser.add_argument("--model_path", type=str, default="")
-    parser.add_argument("--habitat_config_path", type=str, default='scripts/eval/configs/vln_r2r_no_oracle.yaml')
+    # 如果后面habitat这边的数据集和路径什么的要变化，改下面这个文件
+    parser.add_argument("--habitat_config_path", type=str, default='scripts/eval/configs/our_benchmark_config.yaml')
     parser.add_argument("--eval_split", type=str, default='val_unseen')
     parser.add_argument("--output_path", type=str, default='./logs/habitat/test')  #!
     parser.add_argument("--num_future_steps", type=int, default=4)
@@ -86,13 +87,13 @@ def main():
     print(f"Connecting to Trajectory Server at http://{args.gr00t_host}:{args.gr00t_port}/act ...")
     
     # 使用新写的 Client
-    traj_client = InternVATrajectoryClient(
-        url=f"http://{args.gr00t_host}:{args.gr00t_port}/act",
-        max_history=args.num_history # 传入历史长度参数
-    )
-    # traj_client = Gr00tTrajectoryClient(
-    #     url=f"http://{args.gr00t_host}:{args.gr00t_port}/act"
+    # traj_client = InternVATrajectoryClient(
+    #     url=f"http://{args.gr00t_host}:{args.gr00t_port}/act",
+    #     max_history=args.num_history # 传入历史长度参数
     # )
+    traj_client = Gr00tTrajectoryClient(
+        url=f"http://{args.gr00t_host}:{args.gr00t_port}/act"
+    )
 
     # * 2. initialize evaluator
     # ===== 1. 构建 Agent=====

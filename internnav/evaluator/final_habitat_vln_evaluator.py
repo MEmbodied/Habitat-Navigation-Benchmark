@@ -491,8 +491,8 @@ class Evaluator:
         initial_height = self.env.sim.get_agent_state().position[1]
 
         # === 固定初始化动作：LOOK_DOWN × 2 ===
-        # observations = self.env.step(Action.LOOK_DOWN.value)
-        # observations = self.env.step(Action.LOOK_DOWN.value)
+        observations = self.env.step(Action.LOOK_DOWN.value)
+        observations = self.env.step(Action.LOOK_DOWN.value)
 
         self.initial_yaw = observations["compass"][0]
 
@@ -790,87 +790,14 @@ class LLMAgent(BaseAgent):
 
         action_list = self.traj_client.query(req, update_history=True)
         actions = action_list.get("actions", [])
-        self.last_pixel_goal = action_list.get("pixel_goal", None)
+        self.local_actions = actions[:4]
 
-        if not actions:
+        act = self.local_actions.pop(0)
+
+        if act == Action.STOP.value:
             return Action.TURN_LEFT
-        
-        first_action = actions[0]
 
-        # === [CRITICAL LOGIC] 原子操作：如果 Server 决定低头 (5) ===
-        if first_action == 5:
-            #print(f"[LLMAgent] Atomic Look Down triggered at step {obs.step_id}")
-            
-            # A. 内部执行两次低头 (Habitat 中低头一次是 30度，原代码通常做两次)
-            # 注意：这里的 step 不会增加外部 Evaluator 的 step 计数，因为我们在 Agent 内部
-            # 但我们需要从 env 获取新的 observation
-            obs_down_1 = self.env.step(Action.LOOK_DOWN.value)
-            obs_down_2 = self.env.step(Action.LOOK_DOWN.value) # 这张是地板图
-            
-            # B. 构造地板图请求
-            # 我们需要把 obs_down_2 封装成 req 格式
-            # 注意：这里需要重新从 env 获取当前的 info 来构建 req，或者直接复用 obs_down_2
-            # 简单起见，我们手动构建一个类似 build_traj_request 的 payload
-            
-            # 计算新的相对高度 (低头不会变高度，但为了严谨)
-            current_height = self.env.sim.get_agent_state().position[1]
-            
-            req_floor = {
-                "rgb": obs_down_2["rgb"],
-                "depth": obs_down_2["depth"],
-                "gps": obs_down_2["gps"],
-                "yaw": obs_down_2["compass"][0],
-                "camera_height": current_height - self.initial_height,
-                "instruction": self.instruction,
-                "step_id": obs.step_id, # 保持原来的 step_id
-                "min_depth": self.min_depth,
-                "max_depth": self.max_depth
-            }
-            
-            # C. 第二次查询 Server (强制 NavDP)
-            # [关键] update_history=False !!! 不让地板图进历史 !!!
-            # Server 会识别 force_navdp=True (由 Client 根据 update_history=False 自动推导)
-            traj_result = self.traj_client.query(req_floor, update_history=False, do_resize=False)
-            
-            nav_actions = traj_result.get("actions", [])
-            #print(f"[LLMAgent] NavDP returned actions: {nav_actions}")
-            
-            # D. 内部执行两次抬头 (恢复平视)
-            self.env.step(Action.LOOK_UP.value)
-            self.env.step(Action.LOOK_UP.value)
-            
-            # E. 处理返回的动作
-            # Server 之前返回的是 [4, 4, move, move...] (在你的旧 Server 代码里)
-            # 但既然我们在 Client 端已经手动做了抬头，我们需要把 Server 返回的 4,4 去掉
-            # 或者是让 Server 别返回 4,4。
-            # 为了兼容性，我们在这里过滤一下：
-            
-            # 过滤掉开头的 4 (Look Up)
-            valid_actions = [a for a in nav_actions if a != 4 and a != 5]
-            
-            if not valid_actions:
-                 # 如果过滤完没动作了，或者 NavDP 失败，给个默认动作防止死循环
-                 valid_actions = [Action.TURN_LEFT.value]
-
-            # F. 填充 Buffer
-            self.local_actions = valid_actions
-            
-            # G. 返回第一个动作给 Evaluator
-            return Action(self.local_actions.pop(0))
-
-        # === 常规动作 (非 5) ===
-        else:
-            # 如果 Server 返回的是一串动作 (比如连续移动)，存入 Buffer
-            self.local_actions = actions[1:]
-            return Action(first_action)
-        # self.local_actions = actions[:4]
-
-        # act = self.local_actions.pop(0)
-
-        # if act == Action.STOP.value:
-        #     return Action.TURN_LEFT
-
-        # return Action(act)
+        return Action(act)
 
     def set_camera_params(self, params: dict):
         self.camera_height = params["camera_height"]
