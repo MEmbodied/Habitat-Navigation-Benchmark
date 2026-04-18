@@ -37,3 +37,7 @@ uvicorn InternNav.scripts.eval.server_Gr00t:app \
     
 # 2.接着运行eval文件
 python scripts/eval/eval_main.py --model_path /data/sjh/GR00T-Internva/output_uav/checkpoint-300000 --continuous_traj --output_path result/Gr00t/val_unseen_32traj_8steps --save_video
+
+
+2026.4.18更新：
+增加r2r和rxr评测脚本及配置文件，修改了之前的bug
