@@ -518,6 +518,8 @@ class Evaluator:
 
         self.vis_frames = []
 
+        min_distance = float("inf")
+
         while not done and step < self.max_steps:
             if self.env.episode_over:
                 break
@@ -538,6 +540,10 @@ class Evaluator:
             done = self.env.episode_over
             step += 1
 
+            current_dist = self.env.get_metrics().get("distance_to_goal", float("inf"))
+            if current_dist < min_distance:
+                min_distance = current_dist
+
             if self.save_video:
                 frame = observations_to_image(
                     {"rgb":  observations["rgb"]},
@@ -557,7 +563,7 @@ class Evaluator:
         # oracle_success：自己算（等价于你之前的）
         ndtw_score = metrics.get("ndtw", 0.0)
         oracle_success = float(
-            ne < self.config.habitat.task.measurements.success.success_distance
+            min_distance < self.config.habitat.task.measurements.success.success_distance
         )
 
         self.sucs.append(success)
