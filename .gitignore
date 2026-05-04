@@ -153,3 +153,5 @@ internnav/model/basemodel/LongCLIP/
 .gradio/
 result/
 *.swp
+.downloads/vln_r2r_mp3d_v1.zip
+uv.lock

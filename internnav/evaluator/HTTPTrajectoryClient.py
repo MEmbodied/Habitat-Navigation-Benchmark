@@ -1,28 +1,110 @@
 #本文件仅用于连接，主要职责为将evaluator 里产生的observation dict，通过 HTTP 发给外部 Trajectory Server，并把返回结果还原成 Python 对象
 import requests
+import os
 from internnav.evaluator.final_habitat_vln_evaluator import BaseTrajectoryClient
 import json_numpy
 import numpy as np
 import torch
+from datetime import datetime
+from pathlib import Path
+from PIL import Image
 json_numpy.patch()
 
 #更换模型只需要添加并调用一个新的类即可，以下面这个为例
 class Gr00tTrajectoryClient(BaseTrajectoryClient):
-    def __init__(self, url):
+    def __init__(self, url, debug_output_path=None):
         self.url = url
+        self.timeout = float(os.getenv("HABITAT_CLIENT_TIMEOUT", "300"))
+        self.debug_output_path = debug_output_path
 
     def reset(self, instruction: str, **kwargs):
         pass
 
+    def _save_client_observation(self, obs: dict):
+        if not self.debug_output_path:
+            return
+        try:
+            rgb = obs.get("rgb")
+            if rgb is None:
+                return
+            arr = np.asarray(rgb)
+            if arr.ndim == 3 and arr.shape[-1] == 4:
+                arr = arr[..., :3]
+            if arr.ndim != 3 or arr.shape[-1] != 3:
+                return
+            if arr.dtype != np.uint8:
+                if np.issubdtype(arr.dtype, np.floating) and float(np.nanmax(arr)) <= 1.0:
+                    arr = arr * 255.0
+                arr = np.clip(arr, 0, 255).astype(np.uint8)
+            arr = np.ascontiguousarray(arr)
+
+            instruction = str(obs.get("instruction", "unknown_instruction"))
+            safe_instruction = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in instruction)
+            safe_instruction = "_".join(part for part in safe_instruction.split("_") if part)[:60] or "unknown_instruction"
+            step_id = obs.get("step_id", "na")
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            out_dir = Path(self.debug_output_path) / "_client_observations" / safe_instruction
+            out_dir.mkdir(parents=True, exist_ok=True)
+            img_path = out_dir / f"client_{timestamp}_step{step_id}.png"
+            txt_path = out_dir / f"client_{timestamp}_step{step_id}.txt"
+            Image.fromarray(arr).save(img_path)
+
+            mean = arr.mean(axis=(0, 1))
+            std = arr.std(axis=(0, 1))
+            arr_i = arr.astype(np.int16)
+            hdiff = float(np.abs(np.diff(arr_i, axis=1)).mean())
+            vdiff = float(np.abs(np.diff(arr_i, axis=0)).mean())
+            black_frac = float((arr < 5).all(axis=2).mean())
+            with open(txt_path, "w", encoding="utf-8") as f:
+                f.write(f"instruction: {instruction}\n")
+                f.write(f"step_id: {step_id}\n")
+                f.write(f"shape: {arr.shape}\n")
+                f.write(f"dtype: {arr.dtype}\n")
+                f.write(f"min: {int(arr.min())}\n")
+                f.write(f"max: {int(arr.max())}\n")
+                f.write(f"mean: [{mean[0]}, {mean[1]}, {mean[2]}]\n")
+                f.write(f"std: [{std[0]}, {std[1]}, {std[2]}]\n")
+                f.write(f"hfdiff: {hdiff}\n")
+                f.write(f"vfdiff: {vdiff}\n")
+                f.write(f"black_frac: {black_frac}\n")
+        except Exception:
+            return
+
+    def _prepare_observation_payload(self, obs: dict) -> dict:
+        """Make Habitat observations JSON-safe before json_numpy serialization.
+
+        Habitat RGB is often a non-contiguous RGB view over an RGBA render
+        buffer, with strides like (W*4, 4, 1).  Some JSON numpy serializers do
+        not preserve that view correctly, which shows up as colorful noise on
+        the server side.  Send an explicit contiguous RGB copy.
+        """
+        obs_payload = dict(obs)
+        rgb = obs_payload.get("rgb")
+        if rgb is not None:
+            arr = np.asarray(rgb)
+            if arr.ndim == 3 and arr.shape[-1] == 4:
+                arr = arr[..., :3]
+            if arr.ndim == 3 and arr.shape[-1] == 3:
+                if arr.dtype != np.uint8:
+                    if np.issubdtype(arr.dtype, np.floating) and float(np.nanmax(arr)) <= 1.0:
+                        arr = arr * 255.0
+                    arr = np.clip(arr, 0, 255).astype(np.uint8)
+                obs_payload["rgb"] = np.ascontiguousarray(arr)
+        return obs_payload
+
     def query(self, obs: dict, **kwargs) -> list[int]:
+        obs_payload = self._prepare_observation_payload(obs)
         #包一层约定协议
-        payload = {"observation": obs}
+        payload = {"observation": obs_payload}
+        if self.debug_output_path:
+            payload["debug_output_path"] = self.debug_output_path
+            self._save_client_observation(obs_payload)
         # 1. 使用 HTTP 发送
         resp = requests.post(
             self.url,
             data=json_numpy.dumps(payload),  
             headers={"Content-Type": "application/json"},
-            timeout=5.0,
+            timeout=self.timeout,
         )
         resp.raise_for_status()
 
@@ -32,6 +114,11 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
         if isinstance(result, str):
             result = json_numpy.loads(result)
             
+        if "actions" in result:
+            return {
+                "actions": result.get("actions", []),
+                "pixel_goal": result.get("pixel_goal", None),
+            }
         
         # 3. 获取 delta poses 
         dp_actions = result["action"]

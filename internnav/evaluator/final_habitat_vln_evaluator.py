@@ -28,7 +28,11 @@ from habitat_baselines.config.default import get_config as get_habitat_config
 from omegaconf import OmegaConf
 from PIL import Image, ImageDraw, ImageFont
 from torch import Tensor
-from transformers.image_utils import to_numpy_array
+try:
+    from transformers.image_utils import to_numpy_array
+except ImportError:
+    def to_numpy_array(image):
+        return np.asarray(image)
 from internnav.evaluator.ndtw import NDTW
 from abc import ABC, abstractmethod
 from enum import Enum
@@ -373,9 +377,13 @@ class Evaluator:
         self.config_path = config_path
         self.config = get_habitat_config(config_path)
         self.agent = agent
+        self.args = args
 
         with habitat.config.read_write(self.config):
             self.config.habitat.dataset.split = split
+            sim_gpu = getattr(args, "sim_gpu", None)
+            if sim_gpu is not None:
+                self.config.habitat.simulator.habitat_sim_v0.gpu_device_id = int(sim_gpu)
             self.config.habitat.task.measurements.update(
                 {
                     "top_down_map": TopDownMapMeasurementConfig(
@@ -406,7 +414,7 @@ class Evaluator:
         self.agent = agent
         self.max_steps = max_steps
         self.output_path = output_path
-        self.save_video = args.save_video
+        self.save_video = args.save_video and os.getenv("HABITAT_DISABLE_VIDEO_RENDER", "0") != "1"
         self.vis_frames = []
 
         self.sucs = []
@@ -446,6 +454,12 @@ class Evaluator:
             scene_episode_dict[episode.scene_id].append(episode)
         done_res = set()
         result_path = os.path.join(self.output_path, "result.json")
+        eval_episode_ids = getattr(self.args, "eval_episode_ids", "") or ""
+        eval_episode_ids = {
+            episode_id.strip()
+            for episode_id in str(eval_episode_ids).split(",")
+            if episode_id.strip()
+        }
 
         if os.path.exists(result_path):
             with open(result_path, "r") as f:
@@ -462,6 +476,9 @@ class Evaluator:
             scene_id = scene.split("/")[-2]
 
             for episode in episodes[self.idx :: self.env_num]:
+                if eval_episode_ids and str(episode.episode_id) not in eval_episode_ids:
+                    continue
+
                 episode_instruction = (
                     episode.instruction.instruction_text
                     if "objectnav" not in self.config_path
@@ -487,6 +504,7 @@ class Evaluator:
         """
         self.env.current_episode = episode
         observations = self.env.reset()
+        observations = self._repair_observation_render(observations, "reset")
 
         # === 初始高度（给 agent 用）===
         initial_height = self.env.sim.get_agent_state().position[1]
@@ -524,7 +542,8 @@ class Evaluator:
             if self.env.episode_over:
                 break
             # === 模块 3：Habitat → Observation ===
-            obs = self._build_observation(observations, step, agent_height=self.initial_height)
+            current_height = self.env.sim.get_agent_state().position[1]
+            obs = self._build_observation(observations, step, agent_height=current_height)
 
             # === 模块 5（之后）：Observation → Action ===
             action = self.agent.act(obs)
@@ -535,21 +554,48 @@ class Evaluator:
             #     # 这是 evaluator 的 stop，不是 agent 的 stop
             #     break
 
+            print(
+                f"[EvalStep] episode={episode.episode_id} step={step} "
+                f"action={action.value} before_env_step",
+                flush=True,
+            )
             # === 执行动作 ===
             observations = self.env.step(action.value)
+            print(
+                f"[EvalStep] episode={episode.episode_id} step={step} "
+                f"action={action.value} after_env_step",
+                flush=True,
+            )
+            observations = self._repair_observation_render(observations, f"step{step}_action{action.value}")
             done = self.env.episode_over
             step += 1
 
+            print(
+                f"[EvalStep] episode={episode.episode_id} step={step} before_get_metrics",
+                flush=True,
+            )
             current_dist = self.env.get_metrics().get("distance_to_goal", float("inf"))
+            print(
+                f"[EvalStep] episode={episode.episode_id} step={step} after_get_metrics",
+                flush=True,
+            )
             if current_dist < min_distance:
                 min_distance = current_dist
 
             if self.save_video:
+                print(
+                    f"[EvalStep] episode={episode.episode_id} step={step} before_observations_to_image",
+                    flush=True,
+                )
                 frame = observations_to_image(
                     {"rgb":  observations["rgb"]},
                     self.env.get_metrics(),
                 )
                 self.vis_frames.append(frame)
+                print(
+                    f"[EvalStep] episode={episode.episode_id} step={step} after_observations_to_image",
+                    flush=True,
+                )
 
         # ===== episode end =====
         metrics = self.env.get_metrics()
@@ -598,6 +644,7 @@ class Evaluator:
         )
 
         if self.save_video and len(self.vis_frames) > 0:
+            print(f"[Eval] episode={episode.episode_id} before_images_to_video", flush=True)
             scene_id = episode.scene_id.split("/")[-2]
             save_dir = os.path.join(
                 self.output_path,
@@ -613,6 +660,7 @@ class Evaluator:
                 fps=6,
                 quality=9,
             )
+            print(f"[Eval] episode={episode.episode_id} after_images_to_video", flush=True)
             video_name = "video"
 
             # print(
@@ -624,8 +672,73 @@ class Evaluator:
 
         return metrics
 
+    @staticmethod
+    def _rgb_noise_stats(rgb):
+        arr = np.asarray(rgb)
+        if arr.ndim == 3 and arr.shape[-1] == 4:
+            arr = arr[..., :3]
+        if arr.ndim != 3 or arr.shape[-1] != 3:
+            return None
+        if arr.dtype != np.uint8:
+            arr = np.clip(arr, 0, 255).astype(np.uint8)
+        arr_i = arr.astype(np.int16)
+        hdiff = float(np.abs(np.diff(arr_i, axis=1)).mean())
+        vdiff = float(np.abs(np.diff(arr_i, axis=0)).mean())
+        std = float(arr.std(axis=(0, 1)).mean())
+        return hdiff, vdiff, std
+
+    @classmethod
+    def _is_corrupt_rgb(cls, rgb):
+        stats = cls._rgb_noise_stats(rgb)
+        if stats is None:
+            return False
+        hdiff, vdiff, std = stats
+        return hdiff > 50.0 and vdiff > 50.0 and std > 55.0
+
+    def _repair_observation_render(self, observations, context):
+        """Habitat reset/step can occasionally return an uninitialized RGB buffer.
+
+        The bad frame is a stable high-frequency snow pattern. A direct sensor
+        re-render fixes it without changing the agent pose, so patch the RGB
+        and depth entries before the observation reaches the model.
+        """
+        if not isinstance(observations, dict) or "rgb" not in observations:
+            return observations
+        if not Evaluator._is_corrupt_rgb(observations["rgb"]):
+            return observations
+
+        before = Evaluator._rgb_noise_stats(observations["rgb"])
+        max_attempts = int(os.getenv("HABITAT_RGB_REPAIR_ATTEMPTS", "50"))
+        for attempt in range(1, max_attempts + 1):
+            try:
+                fresh = self.env.sim.get_sensor_observations()
+            except Exception as exc:
+                print(f"[Eval] RGB repair failed at {context}: {exc}")
+                return observations
+
+            fresh_rgb = fresh.get("rgb") if isinstance(fresh, dict) else None
+            if fresh_rgb is None:
+                return observations
+
+            if not Evaluator._is_corrupt_rgb(fresh_rgb):
+                repaired = dict(observations)
+                repaired["rgb"] = np.ascontiguousarray(fresh_rgb[..., :3] if fresh_rgb.ndim == 3 and fresh_rgb.shape[-1] == 4 else fresh_rgb)
+                if isinstance(fresh, dict) and "depth" in fresh:
+                    repaired["depth"] = fresh["depth"]
+                after = Evaluator._rgb_noise_stats(repaired["rgb"])
+                print(
+                    f"[Eval] Repaired corrupt RGB at {context} on rerender {attempt}: "
+                    f"{before} -> {after}"
+                )
+                return repaired
+
+        print(f"[Eval] WARNING: RGB still looks corrupt after rerender at {context}: {before}")
+        return observations
+
 
     def _build_observation(self, observations, step_id, agent_height=None):
+        if agent_height is None:
+            agent_height = self.env.sim.get_agent_state().position[1]
         return Observation(
             rgb=observations["rgb"],
             depth=observations["depth"],
@@ -639,8 +752,12 @@ class Evaluator:
     def run(self):
         current_scene = None
         process_bar = None
+        max_eval_episodes = int(getattr(self.args, "max_eval_episodes", 0) or 0)
+        num_eval_episodes = 0
 
         for episode, scene_id, episode_instruction in self.iter_episodes():
+            if max_eval_episodes > 0 and num_eval_episodes >= max_eval_episodes:
+                break
 
             # === new scene ===
             if scene_id != current_scene:
@@ -655,6 +772,7 @@ class Evaluator:
 
             # === run one episode ===
             self.run_episode(episode)
+            num_eval_episodes += 1
 
             # === update bar ===
             process_bar.update(1)

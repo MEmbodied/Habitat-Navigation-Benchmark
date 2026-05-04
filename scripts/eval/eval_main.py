@@ -54,17 +54,26 @@ def parse_args():
     parser.add_argument("--output_path", type=str, default='./logs/habitat/test')  #!
     parser.add_argument("--num_future_steps", type=int, default=4)
     parser.add_argument("--num_frames", type=int, default=32)
-    parser.add_argument("--save_video", action="store_true", default=False)
+    parser.add_argument("--save_video", dest="save_video", action="store_true", default=True)
+    parser.add_argument("--no_save_video", dest="save_video", action="store_false")
     parser.add_argument("--num_history", type=int, default=8)
     parser.add_argument("--resize_w", type=int, default=384)
     parser.add_argument("--resize_h", type=int, default=384)
     parser.add_argument("--predict_step_nums", type=int, default=16)
     parser.add_argument("--continuous_traj", action="store_true", default=False)
     parser.add_argument("--max_new_tokens", type=int, default=1024)
+    parser.add_argument("--max_eval_episodes", type=int, default=0, help="0 means evaluate all episodes")
+    parser.add_argument(
+        "--eval_episode_ids",
+        type=str,
+        default="",
+        help="Comma-separated Habitat episode ids to evaluate. Empty means all episodes.",
+    )
 
     parser.add_argument('--world_size', default=1, type=int, help='number of distributed processes')
     parser.add_argument('--rank', default=0, type=int, help='rank')
     parser.add_argument('--gpu', default=0, type=int, help='gpu')
+    parser.add_argument('--sim_gpu', default=int(os.getenv("HABITAT_SIM_GPU", "5")), type=int, help='Habitat-Sim renderer GPU id')
     parser.add_argument('--port', default='2333')
     parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
     parser.add_argument('--device', default='cuda', help='device to use for training / testing')
@@ -92,7 +101,8 @@ def main():
     #     max_history=args.num_history # 传入历史长度参数
     # )
     traj_client = Gr00tTrajectoryClient(
-        url=f"http://{args.gr00t_host}:{args.gr00t_port}/act"
+        url=f"http://{args.gr00t_host}:{args.gr00t_port}/act",
+        debug_output_path=os.path.join(args.output_path, "xnav_server_snapshots"),
     )
 
     # * 2. initialize evaluator
