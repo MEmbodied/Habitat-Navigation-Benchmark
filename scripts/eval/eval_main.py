@@ -69,6 +69,27 @@ def parse_args():
         default="",
         help="Comma-separated Habitat episode ids to evaluate. Empty means all episodes.",
     )
+    parser.add_argument(
+        "--manual_instruction",
+        type=str,
+        default="",
+        help=(
+            "Override the dataset instruction for every selected episode. "
+            "Use this for manual rollouts only; goal metrics will still follow the original dataset episode."
+        ),
+    )
+    parser.add_argument(
+        "--random_eval_episodes",
+        action="store_true",
+        default=False,
+        help="Shuffle candidate episodes before applying --max_eval_episodes.",
+    )
+    parser.add_argument(
+        "--eval_seed",
+        type=int,
+        default=0,
+        help="Random seed used by --random_eval_episodes.",
+    )
 
     parser.add_argument('--world_size', default=1, type=int, help='number of distributed processes')
     parser.add_argument('--rank', default=0, type=int, help='rank')

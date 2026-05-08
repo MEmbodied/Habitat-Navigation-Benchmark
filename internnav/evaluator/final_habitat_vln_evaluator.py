@@ -61,6 +61,8 @@ def build_traj_request(obs, instruction: str, rel_height: float):
         "camera_height": rel_height,
         "instruction": instruction,
         "step_id": obs.step_id,
+        "episode_id": obs.episode_id,
+        "scene_id": obs.scene_id,
     }
 
 def preprocess_depth_image(
@@ -283,6 +285,8 @@ class Observation:
     compass: float
     step_id: int
     height: float
+    episode_id: str = ""
+    scene_id: str = ""
     # info: dict                 # top_down_map / collisions
 
 class Action(Enum):
@@ -471,6 +475,7 @@ class Evaluator:
                         res["episode_instruction"],
                     ))
 
+        candidates = []
         for scene in sorted(scene_episode_dict.keys()):
             episodes = scene_episode_dict[scene]
             scene_id = scene.split("/")[-2]
@@ -494,7 +499,24 @@ class Evaluator:
                 if episode_key in done_res:
                     continue
 
-                yield episode, scene_id, episode_instruction
+                candidates.append((episode, scene_id, episode_instruction))
+
+        if bool(getattr(self.args, "random_eval_episodes", False)):
+            import random
+
+            rng = random.Random(int(getattr(self.args, "eval_seed", 0) or 0))
+            rng.shuffle(candidates)
+
+        for candidate in candidates:
+            yield candidate
+
+    def _episode_instruction_text(self, episode):
+        manual_instruction = str(getattr(self.args, "manual_instruction", "") or "").strip()
+        if manual_instruction:
+            return manual_instruction
+        if hasattr(episode, "instruction"):
+            return episode.instruction.instruction_text
+        return ""
 
     def _init_episode(self, episode):
         """
@@ -523,10 +545,9 @@ class Evaluator:
     def run_episode(self, episode):
         # ===== Episode init =====
         observations, initial_height = self._init_episode(episode)
+        episode_instruction = self._episode_instruction_text(episode)
         self.agent.reset(
-            episode.instruction.instruction_text
-            if hasattr(episode, "instruction")
-            else "",
+            episode_instruction,
             init_yaw=self.initial_yaw,
             initial_height=self.initial_height
         )
@@ -627,11 +648,13 @@ class Evaluator:
             "ne": ne,
             "ndtw": ndtw_score,
             "steps": step,
-            "episode_instruction": (
+            "episode_instruction": episode_instruction,
+            "dataset_episode_instruction": (
                 episode.instruction.instruction_text
                 if hasattr(episode, "instruction")
                 else ""
             ),
+            "manual_instruction_override": bool(str(getattr(self.args, "manual_instruction", "") or "").strip()),
         }
 
         with open(os.path.join(self.output_path, "result.json"), "a") as f:
@@ -739,6 +762,7 @@ class Evaluator:
     def _build_observation(self, observations, step_id, agent_height=None):
         if agent_height is None:
             agent_height = self.env.sim.get_agent_state().position[1]
+        episode = getattr(self.env, "current_episode", None)
         return Observation(
             rgb=observations["rgb"],
             depth=observations["depth"],
@@ -746,6 +770,8 @@ class Evaluator:
             compass=observations["compass"][0],
             step_id=step_id,
             height=agent_height,
+            episode_id=str(getattr(episode, "episode_id", "")) if episode is not None else "",
+            scene_id=str(getattr(episode, "scene_id", "")) if episode is not None else "",
             # info=self.env.get_metrics(),
         )
     
