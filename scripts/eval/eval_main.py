@@ -57,9 +57,24 @@ def parse_args():
     parser.add_argument("--save_video", dest="save_video", action="store_true", default=True)
     parser.add_argument("--no_save_video", dest="save_video", action="store_false")
     parser.add_argument("--num_history", type=int, default=8)
+    parser.add_argument(
+        "--init_look_down_steps",
+        type=int,
+        default=int(os.getenv("HABITAT_INIT_LOOK_DOWN_STEPS", "2")),
+        help=(
+            "Number of LOOK_DOWN actions after episode reset before evaluation starts. "
+            "Use 0 to keep the default Habitat camera pitch."
+        ),
+    )
     parser.add_argument("--resize_w", type=int, default=384)
     parser.add_argument("--resize_h", type=int, default=384)
     parser.add_argument("--predict_step_nums", type=int, default=16)
+    parser.add_argument(
+        "--success_distance",
+        type=float,
+        default=float(os.getenv("HABITAT_SUCCESS_DISTANCE", "1.0")),
+        help="Distance threshold in meters used by Habitat success/SPL metrics.",
+    )
     parser.add_argument("--continuous_traj", action="store_true", default=False)
     parser.add_argument("--max_new_tokens", type=int, default=1024)
     parser.add_argument("--max_eval_episodes", type=int, default=0, help="0 means evaluate all episodes")
@@ -142,7 +157,6 @@ def main():
         output_path=args.output_path,
         args=args,
         agent=agent,
-        max_steps=500,
         idx=get_rank(),
         env_num=get_world_size(),
     )

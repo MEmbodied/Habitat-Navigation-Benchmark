@@ -388,6 +388,9 @@ class Evaluator:
             sim_gpu = getattr(args, "sim_gpu", None)
             if sim_gpu is not None:
                 self.config.habitat.simulator.habitat_sim_v0.gpu_device_id = int(sim_gpu)
+            success_distance = getattr(args, "success_distance", None)
+            if success_distance is not None:
+                self.config.habitat.task.measurements.success.success_distance = float(success_distance)
             self.config.habitat.task.measurements.update(
                 {
                     "top_down_map": TopDownMapMeasurementConfig(
@@ -419,6 +422,7 @@ class Evaluator:
         self.max_steps = max_steps
         self.output_path = output_path
         self.save_video = args.save_video and os.getenv("HABITAT_DISABLE_VIDEO_RENDER", "0") != "1"
+        self.init_look_down_steps = max(0, int(getattr(args, "init_look_down_steps", 2)))
         self.vis_frames = []
 
         self.sucs = []
@@ -531,9 +535,12 @@ class Evaluator:
         # === 初始高度（给 agent 用）===
         initial_height = self.env.sim.get_agent_state().position[1]
 
-        # === 固定初始化动作：LOOK_DOWN × 2 ===
-        # observations = self.env.step(Action.LOOK_DOWN.value)
-        # observations = self.env.step(Action.LOOK_DOWN.value)
+        for look_down_idx in range(self.init_look_down_steps):
+            observations = self.env.step(Action.LOOK_DOWN.value)
+            observations = self._repair_observation_render(
+                observations,
+                f"init_look_down_{look_down_idx + 1}",
+            )
 
         self.initial_yaw = observations["compass"][0]
 
@@ -647,6 +654,7 @@ class Evaluator:
             "os": oracle_success,   
             "ne": ne,
             "ndtw": ndtw_score,
+            "success_distance": float(self.config.habitat.task.measurements.success.success_distance),
             "steps": step,
             "episode_instruction": episode_instruction,
             "dataset_episode_instruction": (
@@ -834,6 +842,7 @@ class Evaluator:
             "oss_all": sum(oss) / len(oss),
             "nes_all": sum(nes) / len(nes),
             "length": len(sucs),
+            "success_distance": float(self.config.habitat.task.measurements.success.success_distance),
         }
 
         print("===== EVAL SUMMARY =====")
