@@ -92,8 +92,32 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
                 obs_payload["rgb"] = np.ascontiguousarray(arr)
         return obs_payload
 
+    @staticmethod
+    def _json_safe(value):
+        if isinstance(value, dict):
+            return {str(k): Gr00tTrajectoryClient._json_safe(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [Gr00tTrajectoryClient._json_safe(v) for v in value]
+        if isinstance(value, np.ndarray):
+            if value.size <= 16:
+                return value.tolist()
+            return {
+                "shape": list(value.shape),
+                "dtype": str(value.dtype),
+            }
+        if isinstance(value, (np.integer,)):
+            return int(value)
+        if isinstance(value, (np.floating,)):
+            return float(value)
+        if isinstance(value, (np.bool_,)):
+            return bool(value)
+        return value
+
     def query(self, obs: dict, **kwargs) -> list[int]:
         obs_payload = self._prepare_observation_payload(obs)
+        metrics = obs_payload.get("metrics")
+        if isinstance(metrics, dict):
+            obs_payload["metrics"] = self._json_safe(metrics)
         #包一层约定协议
         payload = {"observation": obs_payload}
         if self.debug_output_path:
@@ -115,10 +139,19 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
             result = json_numpy.loads(result)
             
         if "actions" in result:
-            return {
+            response = {
                 "actions": result.get("actions", []),
                 "pixel_goal": result.get("pixel_goal", None),
             }
+            for key in (
+                "oracle_goal_gps",
+                "oracle_goal_progress_index",
+                "oracle_goal_radius",
+                "oracle_max_steps",
+            ):
+                if key in result:
+                    response[key] = result[key]
+            return response
         
         # 3. 获取 delta poses 
         dp_actions = result["action"]

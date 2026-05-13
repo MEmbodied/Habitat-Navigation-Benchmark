@@ -7,7 +7,7 @@ import os
 import random
 import re
 from collections import OrderedDict
-from typing import Any
+from typing import Any, Optional
 
 import habitat
 import numpy as np
@@ -23,6 +23,7 @@ from habitat.config.default_structured_configs import (
     TopDownMapMeasurementConfig,
 )
 from habitat.tasks.nav.shortest_path_follower import ShortestPathFollower
+from habitat.utils.geometry_utils import quaternion_from_coeff
 from habitat.utils.visualizations.utils import images_to_video, observations_to_image
 from habitat_baselines.config.default import get_config as get_habitat_config
 from omegaconf import OmegaConf
@@ -63,6 +64,8 @@ def build_traj_request(obs, instruction: str, rel_height: float):
         "step_id": obs.step_id,
         "episode_id": obs.episode_id,
         "scene_id": obs.scene_id,
+        "metrics": obs.metrics,
+        "reference_path_gps": obs.reference_path_gps,
     }
 
 def preprocess_depth_image(
@@ -287,7 +290,8 @@ class Observation:
     height: float
     episode_id: str = ""
     scene_id: str = ""
-    # info: dict                 # top_down_map / collisions
+    metrics: Optional[dict] = None
+    reference_path_gps: Optional[list] = None
 
 class Action(Enum):
     STOP = 0
@@ -571,7 +575,12 @@ class Evaluator:
                 break
             # === 模块 3：Habitat → Observation ===
             current_height = self.env.sim.get_agent_state().position[1]
-            obs = self._build_observation(observations, step, agent_height=current_height)
+            obs = self._build_observation(
+                observations,
+                step,
+                agent_height=current_height,
+                metrics=self.env.get_metrics(),
+            )
 
             # === 模块 5（之后）：Observation → Action ===
             action = self.agent.act(obs)
@@ -767,10 +776,21 @@ class Evaluator:
         return observations
 
 
-    def _build_observation(self, observations, step_id, agent_height=None):
+    def _build_observation(self, observations, step_id, agent_height=None, metrics=None):
         if agent_height is None:
             agent_height = self.env.sim.get_agent_state().position[1]
         episode = getattr(self.env, "current_episode", None)
+        reference_path_gps = []
+        if episode is not None and getattr(episode, "reference_path", None):
+            try:
+                start_position = np.asarray(getattr(episode, "start_position"), dtype=np.float64)
+                rotation = quaternion_from_coeff(getattr(episode, "start_rotation"))
+                inv_rotation = rotation.inverse()
+                for point in getattr(episode, "reference_path", []) or []:
+                    local_xyz = quaternion.rotate_vectors(inv_rotation, np.asarray(point, dtype=np.float64) - start_position)
+                    reference_path_gps.append([float(-local_xyz[2]), float(local_xyz[0])])
+            except Exception:
+                reference_path_gps = []
         return Observation(
             rgb=observations["rgb"],
             depth=observations["depth"],
@@ -780,7 +800,8 @@ class Evaluator:
             height=agent_height,
             episode_id=str(getattr(episode, "episode_id", "")) if episode is not None else "",
             scene_id=str(getattr(episode, "scene_id", "")) if episode is not None else "",
-            # info=self.env.get_metrics(),
+            metrics=metrics or {},
+            reference_path_gps=reference_path_gps,
         )
     
     def run(self):
@@ -911,6 +932,9 @@ class LLMAgent(BaseAgent):
         self._pointnav_policy = None
         self._pointnav_depth_image_shape = (256, 256)
         self._pointnav_stop_radius = 0.2
+        self._dagger_oracle_goal_world = None
+        self._dagger_oracle_remaining = 0
+        self._dagger_oracle_follower = None
 
     def set_env(self, env):
         self.env = env
@@ -932,14 +956,84 @@ class LLMAgent(BaseAgent):
         self.goal = None
         self.local_actions = []
         self.step_id = 0
+        self._dagger_oracle_goal_world = None
+        self._dagger_oracle_remaining = 0
+        self._dagger_oracle_follower = None
 
         self.last_pixel_goal = None
+
+    def _dagger_goal_world_from_response(self, goal_gps, goal_index=None):
+        if self.env is None:
+            return None
+        episode = getattr(self.env, "current_episode", None)
+        if goal_gps is None or episode is None:
+            return None
+        start_position = np.asarray(getattr(episode, "start_position", None), dtype=np.float32)
+        start_rotation = getattr(episode, "start_rotation", None)
+        if start_position.shape[0] != 3 or start_rotation is None:
+            return None
+        rotation = quaternion_from_coeff(start_rotation)
+        gps_xy = np.asarray(goal_gps, dtype=np.float32).reshape(-1)
+        if gps_xy.shape[0] < 2:
+            return None
+        local_xyz = np.asarray([gps_xy[1], 0.0, -gps_xy[0]], dtype=np.float64)
+        return (start_position + quaternion.rotate_vectors(rotation, local_xyz)).astype(np.float32)
+
+    def _start_dagger_oracle_rejoin(self, action_response: dict):
+        goal_gps = action_response.get("oracle_goal_gps")
+        goal_index = action_response.get("oracle_goal_progress_index")
+        goal_world = self._dagger_goal_world_from_response(goal_gps, goal_index)
+        if goal_world is None:
+            self._dagger_oracle_goal_world = None
+            self._dagger_oracle_remaining = 0
+            self._dagger_oracle_follower = None
+            return
+        radius = float(action_response.get("oracle_goal_radius", 0.35))
+        self._dagger_oracle_goal_world = np.asarray(goal_world, dtype=np.float32)
+        self._dagger_oracle_remaining = int(action_response.get("oracle_max_steps", 80))
+        self._dagger_oracle_follower = ShortestPathFollower(self.env.sim, radius, False)
+        print(
+            f"[LLMAgent] DAgger Habitat oracle rejoin start: "
+            f"goal_gps={goal_gps} goal_index={goal_index} "
+            f"goal_world={self._dagger_oracle_goal_world.tolist()} "
+            f"radius={radius} max_steps={self._dagger_oracle_remaining}"
+        )
+        try:
+            self._dagger_oracle_follower.mode = "geodesic_path"
+        except Exception:
+            pass
+
+    def _next_dagger_oracle_action(self):
+        if (
+            self._dagger_oracle_goal_world is None
+            or self._dagger_oracle_follower is None
+            or self._dagger_oracle_remaining <= 0
+        ):
+            self._dagger_oracle_goal_world = None
+            self._dagger_oracle_remaining = 0
+            self._dagger_oracle_follower = None
+            return None
+        action = self._dagger_oracle_follower.get_next_action(self._dagger_oracle_goal_world)
+        if action is None or int(action) == Action.STOP.value:
+            print("[LLMAgent] DAgger Habitat oracle rejoin done")
+            self._dagger_oracle_goal_world = None
+            self._dagger_oracle_remaining = 0
+            self._dagger_oracle_follower = None
+            return None
+        self._dagger_oracle_remaining -= 1
+        print(f"[LLMAgent] DAgger Habitat oracle action={int(action)} remaining={self._dagger_oracle_remaining}")
+        return int(action)
 
     def act(self, obs: Observation) -> Action:
 
         if self.local_actions:
             self.last_pixel_goal = None
             return Action(self.local_actions.pop(0))
+
+        oracle_action = self._next_dagger_oracle_action()
+        if oracle_action is not None:
+            self.last_pixel_goal = None
+            return Action(oracle_action)
 
         req = build_traj_request(
             obs,
@@ -953,8 +1047,13 @@ class LLMAgent(BaseAgent):
         action_list = self.traj_client.query(req, update_history=True)
         actions = action_list.get("actions", [])
         self.last_pixel_goal = action_list.get("pixel_goal", None)
+        if action_list.get("oracle_goal_gps") is not None:
+            self._start_dagger_oracle_rejoin(action_list)
 
         if not actions:
+            oracle_action = self._next_dagger_oracle_action()
+            if oracle_action is not None:
+                return Action(oracle_action)
             return Action.TURN_LEFT
         
         first_action = actions[0]
