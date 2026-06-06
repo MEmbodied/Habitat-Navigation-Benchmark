@@ -49,7 +49,7 @@ def parse_args():
     parser.add_argument("--local_rank", default=0, type=int, help="node rank")
     parser.add_argument("--model_path", type=str, default="")
     # 如果后面habitat这边的数据集和路径什么的要变化，改下面这个文件
-    parser.add_argument("--habitat_config_path", type=str, default='scripts/eval/configs/our_benchmark_config.yaml')
+    parser.add_argument("--habitat_config_path", type=str, default='scripts/eval/configs/vln_r2r_no_oracle.yaml')
     parser.add_argument("--eval_split", type=str, default='val_unseen')
     parser.add_argument("--output_path", type=str, default='./logs/habitat/test')  #!
     parser.add_argument("--num_future_steps", type=int, default=4)

@@ -159,6 +159,13 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
                 "oracle_goal_progress_index",
                 "oracle_goal_radius",
                 "oracle_max_steps",
+                "post_error_student_steps",
+                "dagger_failure_type",
+                "dagger_correction_weight",
+                "dagger_student_actions_discrete",
+                "dagger_teacher_actions_discrete",
+                "dagger_final_actions_discrete",
+                "dagger_correction_applied",
             ):
                 if key in result:
                     response[key] = result[key]

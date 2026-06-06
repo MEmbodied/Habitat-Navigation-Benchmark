@@ -8,7 +8,7 @@ from habitat.tasks.nav.shortest_path_follower import ShortestPathFollower
 from habitat_baselines.config.default import get_config as get_habitat_config
 
 # 配置参数
-CONFIG_PATH = "scripts/eval/configs/our_benchmark_config_sub_r2r.yaml" # 确认路径正确
+CONFIG_PATH = "scripts/eval/configs/vln_r2r_no_oracle.yaml"
 OUTPUT_DIR = "/data/sjh/InternNav/output"
 SPLIT = "val_unseen"
 

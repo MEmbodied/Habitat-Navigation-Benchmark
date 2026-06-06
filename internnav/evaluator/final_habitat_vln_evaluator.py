@@ -439,6 +439,7 @@ class Evaluator:
         self.save_video = args.save_video and os.getenv("HABITAT_DISABLE_VIDEO_RENDER", "0") != "1"
         self.init_look_down_steps = max(0, int(getattr(args, "init_look_down_steps", 2)))
         self.vis_frames = []
+        self._prev_video_map_coord = None
 
         self.sucs = []
         self.spls = []
@@ -565,6 +566,7 @@ class Evaluator:
 
         self.vis_frames = []
         self.initial_height = initial_height
+        self._prev_video_map_coord = None
 
         return observations, initial_height
 
@@ -599,6 +601,9 @@ class Evaluator:
 
             # === 模块 5（之后）：Observation → Action ===
             action = self.agent.act(obs)
+            action_vis = self._agent_action_vis_metadata()
+            before_metrics = self.env.get_metrics()
+            prev_map_coord = self._current_map_coord(before_metrics)
 
             # === 模块 4：STOP by env metric（关键）===
             # info = self.env.get_metrics()
@@ -647,9 +652,16 @@ class Evaluator:
                     f"[EvalStep] episode={episode.episode_id} step={step} before_observations_to_image",
                     flush=True,
                 )
+                video_metrics = self.env.get_metrics()
                 frame = observations_to_image(
                     {"rgb":  observations["rgb"]},
-                    self.env.get_metrics(),
+                    video_metrics,
+                )
+                frame = self._draw_dagger_path_on_frame(
+                    frame,
+                    video_metrics,
+                    prev_map_coord=prev_map_coord,
+                    action_vis=action_vis,
                 )
                 self.vis_frames.append(frame)
                 print(
@@ -732,8 +744,91 @@ class Evaluator:
             # )
 
         self.vis_frames.clear()
+        self._prev_video_map_coord = None
 
         return metrics
+
+    @staticmethod
+    def _current_map_coord(metrics):
+        top_down_map = metrics.get("top_down_map") if isinstance(metrics, dict) else None
+        if not isinstance(top_down_map, dict):
+            return None
+        coords = top_down_map.get("agent_map_coord") or []
+        if not coords:
+            return None
+        try:
+            coord = coords[0]
+            return (int(coord[0]), int(coord[1]))
+        except Exception:
+            return None
+
+    def _agent_action_vis_metadata(self):
+        metadata = getattr(self.agent, "last_action_metadata", None)
+        if not isinstance(metadata, dict):
+            return {}
+        return dict(metadata)
+
+    def _draw_dagger_path_on_frame(self, frame, metrics, *, prev_map_coord, action_vis):
+        if "dagger_correction_applied" not in action_vis:
+            return frame
+        if not isinstance(metrics, dict):
+            return frame
+        top_down_map = metrics.get("top_down_map")
+        if not isinstance(top_down_map, dict) or "map" not in top_down_map:
+            return frame
+
+        current_map_coord = self._current_map_coord(metrics)
+        if current_map_coord is None:
+            return frame
+        if prev_map_coord is None:
+            prev_map_coord = self._prev_video_map_coord
+        self._prev_video_map_coord = current_map_coord
+        if prev_map_coord is None:
+            return frame
+
+        frame = np.ascontiguousarray(frame.copy())
+        map_shape = np.asarray(top_down_map["map"]).shape[:2]
+        if len(map_shape) != 2:
+            return frame
+
+        rgb_width = int(metrics.get("_xnav_rgb_width", 640))
+        if frame.shape[1] > 640:
+            rgb_width = 640
+
+        def project(coord):
+            row, col = int(coord[0]), int(coord[1])
+            old_h, old_w = int(map_shape[0]), int(map_shape[1])
+            if old_h > old_w:
+                rot_row = old_w - 1 - col
+                rot_col = row
+                fit_h = old_w
+            else:
+                rot_row = row
+                rot_col = col
+                fit_h = old_h
+            scale = float(frame.shape[0]) / max(1.0, float(fit_h))
+            return (
+                int(round(rgb_width + rot_col * scale)),
+                int(round(rot_row * scale)),
+            )
+
+        p0 = project(prev_map_coord)
+        p1 = project(current_map_coord)
+        correction_applied = bool(action_vis.get("dagger_correction_applied", False))
+        color = (220, 38, 38) if correction_applied else (37, 99, 235)
+        thickness = 7 if correction_applied else 5
+
+        import cv2
+
+        cv2.line(frame, p0, p1, color, thickness=thickness, lineType=cv2.LINE_AA)
+        if correction_applied:
+            cv2.circle(frame, p1, 12, color, thickness=-1, lineType=cv2.LINE_AA)
+            label = str(action_vis.get("dagger_failure_type") or "DAgger correction")
+            x0 = max(rgb_width + 8, min(frame.shape[1] - 360, p1[0] + 14))
+            y0 = max(26, min(frame.shape[0] - 12, p1[1] - 14))
+            cv2.rectangle(frame, (x0 - 4, y0 - 20), (min(frame.shape[1] - 2, x0 + 340), y0 + 6), (255, 255, 255), -1)
+            cv2.putText(frame, label, (x0, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 2, cv2.LINE_AA)
+        return frame
 
     def _write_step_metrics(self, episode, episode_instruction: str, step: int, metrics: dict, min_distance: float):
         path = os.path.join(self.output_path, "step_metrics.jsonl")
@@ -1039,8 +1134,17 @@ class LLMAgent(BaseAgent):
         self._pointnav_depth_image_shape = (256, 256)
         self._pointnav_stop_radius = 0.2
         self._dagger_oracle_goal_world = None
+        self._dagger_oracle_goal_index = None
         self._dagger_oracle_remaining = 0
+        self._dagger_oracle_hold_remaining = 0
+        self._dagger_oracle_hold_steps = max(0, int(os.getenv("XNAV_DAGGER_ORACLE_HOLD_STEPS", "12")))
+        self._dagger_oracle_hold_lookahead = max(1, int(os.getenv("XNAV_DAGGER_ORACLE_HOLD_LOOKAHEAD_POINTS", "2")))
+        self._dagger_oracle_stop_at_final = os.getenv("XNAV_DAGGER_ORACLE_STOP_AT_FINAL", "1") != "0"
+        self._dagger_oracle_phase = None
         self._dagger_oracle_follower = None
+        self._dagger_pending_oracle_response = None
+        self._dagger_post_error_student_remaining = 0
+        self.last_action_metadata = {}
 
     def set_env(self, env):
         self.env = env
@@ -1063,8 +1167,14 @@ class LLMAgent(BaseAgent):
         self.local_actions = []
         self.step_id = 0
         self._dagger_oracle_goal_world = None
+        self._dagger_oracle_goal_index = None
         self._dagger_oracle_remaining = 0
+        self._dagger_oracle_hold_remaining = 0
+        self._dagger_oracle_phase = None
         self._dagger_oracle_follower = None
+        self._dagger_pending_oracle_response = None
+        self._dagger_post_error_student_remaining = 0
+        self.last_action_metadata = {}
 
         self.last_pixel_goal = None
 
@@ -1091,44 +1201,226 @@ class LLMAgent(BaseAgent):
         goal_world = self._dagger_goal_world_from_response(goal_gps, goal_index)
         if goal_world is None:
             self._dagger_oracle_goal_world = None
+            self._dagger_oracle_goal_index = None
             self._dagger_oracle_remaining = 0
+            self._dagger_oracle_hold_remaining = 0
+            self._dagger_oracle_phase = None
             self._dagger_oracle_follower = None
             return
         radius = float(action_response.get("oracle_goal_radius", 0.35))
         self._dagger_oracle_goal_world = np.asarray(goal_world, dtype=np.float32)
+        self._dagger_oracle_goal_index = int(goal_index) if goal_index is not None else None
         self._dagger_oracle_remaining = int(action_response.get("oracle_max_steps", 80))
+        self._dagger_oracle_hold_remaining = int(self._dagger_oracle_hold_steps)
+        self._dagger_oracle_phase = "rejoin"
         self._dagger_oracle_follower = ShortestPathFollower(self.env.sim, radius, False)
         print(
             f"[LLMAgent] DAgger Habitat oracle rejoin start: "
             f"goal_gps={goal_gps} goal_index={goal_index} "
             f"goal_world={self._dagger_oracle_goal_world.tolist()} "
-            f"radius={radius} max_steps={self._dagger_oracle_remaining}"
+            f"radius={radius} max_steps={self._dagger_oracle_remaining} "
+            f"hold_steps={self._dagger_oracle_hold_remaining} "
+            f"hold_lookahead={self._dagger_oracle_hold_lookahead}"
         )
         try:
             self._dagger_oracle_follower.mode = "geodesic_path"
         except Exception:
             pass
 
+    def _reset_dagger_oracle(self):
+        self._dagger_oracle_goal_world = None
+        self._dagger_oracle_goal_index = None
+        self._dagger_oracle_remaining = 0
+        self._dagger_oracle_hold_remaining = 0
+        self._dagger_oracle_phase = None
+        self._dagger_oracle_follower = None
+
+    def _queue_dagger_oracle_after_student_rollout(self, action_response: dict) -> bool:
+        if not isinstance(action_response, dict) or action_response.get("oracle_goal_gps") is None:
+            return False
+        post_error_steps = max(0, int(action_response.get("post_error_student_steps", 0) or 0))
+        if post_error_steps <= 0:
+            self._start_dagger_oracle_rejoin(action_response)
+            return False
+        self._dagger_pending_oracle_response = dict(action_response)
+        if self._dagger_post_error_student_remaining <= 0:
+            self._dagger_post_error_student_remaining = post_error_steps
+        print(
+            f"[LLMAgent] DAgger queued oracle recovery after student rollout: "
+            f"remaining={self._dagger_post_error_student_remaining} "
+            f"goal_index={action_response.get('oracle_goal_progress_index')}"
+        )
+        return True
+
+    def _maybe_start_pending_dagger_oracle(self) -> bool:
+        if self._dagger_pending_oracle_response is None:
+            return False
+        if self._dagger_post_error_student_remaining > 0:
+            return False
+        action_response = self._dagger_pending_oracle_response
+        self._dagger_pending_oracle_response = None
+        print("[LLMAgent] DAgger post-error student rollout done; starting oracle recovery")
+        self._start_dagger_oracle_rejoin(action_response)
+        return True
+
+    def _mark_post_error_student_action_used(self):
+        if self._dagger_pending_oracle_response is None:
+            return
+        if self._dagger_post_error_student_remaining > 0:
+            self._dagger_post_error_student_remaining -= 1
+        print(
+            f"[LLMAgent] DAgger post-error student action executed; "
+            f"remaining={self._dagger_post_error_student_remaining}"
+        )
+
+    @staticmethod
+    def _dagger_execution_metadata(metadata: dict, *, correction_applied: bool) -> dict:
+        out = dict(metadata or {})
+        out["dagger_correction_applied"] = bool(correction_applied)
+        if not correction_applied:
+            out["dagger_execution_phase"] = "post_error_student"
+        return out
+
+    def _advance_dagger_oracle_hold_target(self) -> bool:
+        if self.env is None or self._dagger_oracle_goal_index is None:
+            return False
+        episode = getattr(self.env, "current_episode", None)
+        reference_path = list(getattr(episode, "reference_path", []) or [])
+        if not reference_path:
+            return False
+        current_idx = int(self._dagger_oracle_goal_index)
+        if current_idx >= len(reference_path) - 1:
+            return False
+        lookahead = max(1, int(self._dagger_oracle_hold_lookahead))
+        target_idx = min(len(reference_path) - 1, current_idx + lookahead)
+        if target_idx <= current_idx:
+            return False
+        target_world = np.asarray(reference_path[target_idx], dtype=np.float32)
+        if target_world.shape[0] != 3:
+            return False
+        self._dagger_oracle_goal_index = target_idx
+        self._dagger_oracle_goal_world = target_world
+        self._dagger_oracle_phase = "hold"
+        print(
+            f"[LLMAgent] DAgger Habitat oracle hold target: "
+            f"goal_index={target_idx} goal_world={target_world.tolist()} "
+            f"hold_remaining={self._dagger_oracle_hold_remaining}"
+        )
+        return True
+
+    def _dagger_oracle_at_final_reference(self) -> bool:
+        if self.env is None or self._dagger_oracle_goal_index is None:
+            return False
+        episode = getattr(self.env, "current_episode", None)
+        reference_path = list(getattr(episode, "reference_path", []) or [])
+        return bool(reference_path) and int(self._dagger_oracle_goal_index) >= len(reference_path) - 1
+
+    def _dagger_oracle_success_reached(self) -> bool:
+        if self.env is None:
+            return False
+        try:
+            metrics = self.env.get_metrics()
+        except Exception:
+            return False
+        distance = metrics.get("distance_to_goal") if isinstance(metrics, dict) else None
+        success_distance = metrics.get("success_distance", 1.0) if isinstance(metrics, dict) else 1.0
+        if distance is None:
+            return bool(metrics.get("success", False)) if isinstance(metrics, dict) else False
+        try:
+            return float(distance) <= float(success_distance)
+        except Exception:
+            return False
+
+    def _advance_dagger_oracle_official_goal_target(self) -> bool:
+        if self.env is None:
+            return False
+        episode = getattr(self.env, "current_episode", None)
+        goals = list(getattr(episode, "goals", []) or [])
+        if not goals:
+            return False
+        goal = goals[0]
+        goal_position = goal.get("position") if isinstance(goal, dict) else getattr(goal, "position", None)
+        if goal_position is None:
+            return False
+        target_world = np.asarray(goal_position, dtype=np.float32)
+        if target_world.shape[0] != 3:
+            return False
+        self._dagger_oracle_goal_world = target_world
+        self._dagger_oracle_goal_index = None
+        self._dagger_oracle_phase = "official_goal"
+        self._dagger_oracle_follower = ShortestPathFollower(self.env.sim, 0.35, False)
+        try:
+            self._dagger_oracle_follower.mode = "geodesic_path"
+        except Exception:
+            pass
+        print(
+            f"[LLMAgent] DAgger Habitat oracle official goal target: "
+            f"goal_world={target_world.tolist()} remaining={self._dagger_oracle_remaining}"
+        )
+        return True
+
     def _next_dagger_oracle_action(self):
-        if (
-            self._dagger_oracle_goal_world is None
-            or self._dagger_oracle_follower is None
-            or self._dagger_oracle_remaining <= 0
-        ):
-            self._dagger_oracle_goal_world = None
-            self._dagger_oracle_remaining = 0
-            self._dagger_oracle_follower = None
-            return None
-        action = self._dagger_oracle_follower.get_next_action(self._dagger_oracle_goal_world)
-        if action is None or int(action) == Action.STOP.value:
-            print("[LLMAgent] DAgger Habitat oracle rejoin done")
-            self._dagger_oracle_goal_world = None
-            self._dagger_oracle_remaining = 0
-            self._dagger_oracle_follower = None
-            return None
-        self._dagger_oracle_remaining -= 1
-        print(f"[LLMAgent] DAgger Habitat oracle action={int(action)} remaining={self._dagger_oracle_remaining}")
-        return int(action)
+        while True:
+            if (
+                self._dagger_oracle_goal_world is None
+                or self._dagger_oracle_follower is None
+                or self._dagger_oracle_remaining <= 0
+            ):
+                self._reset_dagger_oracle()
+                return None
+            if self._dagger_oracle_phase == "hold" and self._dagger_oracle_hold_remaining <= 0:
+                print("[LLMAgent] DAgger Habitat oracle hold budget exhausted")
+                self._reset_dagger_oracle()
+                return None
+            action = self._dagger_oracle_follower.get_next_action(self._dagger_oracle_goal_world)
+            if action is None or int(action) == Action.STOP.value:
+                phase = self._dagger_oracle_phase or "rejoin"
+                print(f"[LLMAgent] DAgger Habitat oracle {phase} target reached")
+                if self._dagger_oracle_hold_remaining > 0 and self._advance_dagger_oracle_hold_target():
+                    continue
+                if self._dagger_oracle_stop_at_final and self._dagger_oracle_at_final_reference():
+                    if not self._dagger_oracle_success_reached() and self._advance_dagger_oracle_official_goal_target():
+                        continue
+                    print("[LLMAgent] DAgger Habitat oracle success/final target reached; issuing STOP")
+                    self._reset_dagger_oracle()
+                    self.last_action_metadata = {
+                        "dagger_correction_applied": True,
+                        "dagger_failure_type": "gt_divergence_habitat_oracle_final_stop",
+                    }
+                    return int(Action.STOP.value)
+                print("[LLMAgent] DAgger Habitat oracle rejoin done")
+                self._reset_dagger_oracle()
+                return None
+            self._dagger_oracle_remaining -= 1
+            if self._dagger_oracle_phase == "hold":
+                self._dagger_oracle_hold_remaining -= 1
+            print(
+                f"[LLMAgent] DAgger Habitat oracle action={int(action)} "
+                f"phase={self._dagger_oracle_phase or 'rejoin'} "
+                f"remaining={self._dagger_oracle_remaining} "
+                f"hold_remaining={self._dagger_oracle_hold_remaining}"
+            )
+            self.last_action_metadata = {
+                "dagger_correction_applied": True,
+                "dagger_failure_type": "gt_divergence_habitat_oracle_rejoin",
+            }
+            return int(action)
+
+    @staticmethod
+    def _dagger_metadata_from_response(action_response: dict) -> dict:
+        if not isinstance(action_response, dict):
+            return {}
+        if "dagger_correction_applied" not in action_response:
+            return {}
+        return {
+            "dagger_correction_applied": bool(action_response.get("dagger_correction_applied", False)),
+            "dagger_correction_weight": float(action_response.get("dagger_correction_weight", 0.0) or 0.0),
+            "dagger_failure_type": action_response.get("dagger_failure_type"),
+            "dagger_student_actions_discrete": action_response.get("dagger_student_actions_discrete") or [],
+            "dagger_teacher_actions_discrete": action_response.get("dagger_teacher_actions_discrete") or [],
+            "dagger_final_actions_discrete": action_response.get("dagger_final_actions_discrete") or [],
+            "post_error_student_steps": int(action_response.get("post_error_student_steps", 0) or 0),
+        }
 
     def act(self, obs: Observation) -> Action:
 
@@ -1139,12 +1431,19 @@ class LLMAgent(BaseAgent):
                 flush=True,
             )
             self.last_pixel_goal = None
+            self.last_action_metadata = {}
             return Action(self.local_actions.pop(0))
 
         oracle_action = self._next_dagger_oracle_action()
         if oracle_action is not None:
             self.last_pixel_goal = None
             return Action(oracle_action)
+
+        if self._maybe_start_pending_dagger_oracle():
+            oracle_action = self._next_dagger_oracle_action()
+            if oracle_action is not None:
+                self.last_pixel_goal = None
+                return Action(oracle_action)
 
         req = build_traj_request(
             obs,
@@ -1154,21 +1453,37 @@ class LLMAgent(BaseAgent):
 
         req["min_depth"] = self.min_depth
         req["max_depth"] = self.max_depth
+        if self._dagger_pending_oracle_response is not None:
+            req["dagger_force_teacher_label"] = True
+            req["dagger_post_error_student_remaining"] = int(self._dagger_post_error_student_remaining)
 
         action_list = self.traj_client.query(req, update_history=True)
         actions = action_list.get("actions", [])
+        response_metadata = self._dagger_metadata_from_response(action_list)
         print(
             f"[LLMAgent] server returned actions={actions} step={obs.step_id}",
             flush=True,
         )
         self.last_pixel_goal = action_list.get("pixel_goal", None)
+        queued_oracle = False
         if action_list.get("oracle_goal_gps") is not None:
-            self._start_dagger_oracle_rejoin(action_list)
+            queued_oracle = self._queue_dagger_oracle_after_student_rollout(action_list)
 
         if not actions:
+            if queued_oracle:
+                student_actions = response_metadata.get("dagger_student_actions_discrete") or []
+                if student_actions:
+                    action = int(student_actions[0])
+                    self._mark_post_error_student_action_used()
+                    self.last_action_metadata = self._dagger_execution_metadata(
+                        response_metadata,
+                        correction_applied=False,
+                    )
+                    return Action(action)
             oracle_action = self._next_dagger_oracle_action()
             if oracle_action is not None:
                 return Action(oracle_action)
+            self.last_action_metadata = {}
             return Action.TURN_LEFT
         
         first_action = actions[0]
@@ -1207,6 +1522,7 @@ class LLMAgent(BaseAgent):
             # [关键] update_history=False !!! 不让地板图进历史 !!!
             # Server 会识别 force_navdp=True (由 Client 根据 update_history=False 自动推导)
             traj_result = self.traj_client.query(req_floor, update_history=False, do_resize=False)
+            response_metadata = self._dagger_metadata_from_response(traj_result)
             
             nav_actions = traj_result.get("actions", [])
             #print(f"[LLMAgent] NavDP returned actions: {nav_actions}")
@@ -1230,14 +1546,23 @@ class LLMAgent(BaseAgent):
 
             # F. 填充 Buffer
             self.local_actions = valid_actions
-            
+
             # G. 返回第一个动作给 Evaluator
+            self.last_action_metadata = response_metadata
             return Action(self.local_actions.pop(0))
 
         # === 常规动作 (非 5) ===
         else:
             # 如果 Server 返回的是一串动作 (比如连续移动)，存入 Buffer
             self.local_actions = actions[1:]
+            if self._dagger_pending_oracle_response is not None:
+                self._mark_post_error_student_action_used()
+                self.last_action_metadata = self._dagger_execution_metadata(
+                    response_metadata,
+                    correction_applied=False,
+                )
+            else:
+                self.last_action_metadata = response_metadata
             return Action(first_action)
         # self.local_actions = actions[:4]
 
