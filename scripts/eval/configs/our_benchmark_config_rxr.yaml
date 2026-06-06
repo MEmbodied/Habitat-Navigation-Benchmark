@@ -13,7 +13,7 @@ defaults:
 habitat:
   environment:
     # 🚀 修改点 1：RxR 路径较长，步数上限提升至 50000
-    max_episode_steps: 50000
+    max_episode_steps: 500
     iterator_options:
       max_scene_repeat_steps: 50000
       shuffle: False

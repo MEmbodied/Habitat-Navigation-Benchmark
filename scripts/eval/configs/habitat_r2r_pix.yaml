@@ -13,7 +13,7 @@ defaults:
 
 habitat:
   environment:
-    max_episode_steps: 10000
+    max_episode_steps: 500
     iterator_options:
       max_scene_repeat_steps: 50000
       shuffle: False
@@ -51,11 +51,11 @@ habitat:
         success_distance: 3.0
       spl:
         type: SPL
-      oracle_success:
-        type: OracleSuccess
-        # success_distance: 3.0
-      oracle_navigation_error:
-        type: OracleNavigationError
+      # oracle_success:
+      #   type: OracleSuccess
+      #   # success_distance: 3.0
+      # oracle_navigation_error:
+      #   type: OracleNavigationError
     actions:
       stop:
         type: StopAction

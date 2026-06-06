@@ -12,7 +12,7 @@ defaults:
 
 habitat:
   environment:
-    max_episode_steps: 5000
+    max_episode_steps: 500
     iterator_options:
       max_scene_repeat_steps: 50000
       shuffle: False
