@@ -58,6 +58,17 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
             with open(txt_path, "w", encoding="utf-8") as f:
                 f.write(f"instruction: {instruction}\n")
                 f.write(f"step_id: {step_id}\n")
+                for key in ("gps", "yaw", "camera_height"):
+                    if key in obs:
+                        f.write(f"{key}: {self._json_safe(obs.get(key))}\n")
+                metrics = obs.get("metrics")
+                if isinstance(metrics, dict):
+                    small_metrics = {
+                        key: metrics.get(key)
+                        for key in ("distance_to_goal", "success", "spl", "ndtw")
+                        if key in metrics
+                    }
+                    f.write(f"metrics: {self._json_safe(small_metrics)}\n")
                 f.write(f"shape: {arr.shape}\n")
                 f.write(f"dtype: {arr.dtype}\n")
                 f.write(f"min: {int(arr.min())}\n")

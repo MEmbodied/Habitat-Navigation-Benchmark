@@ -389,6 +389,15 @@ class Evaluator:
 
         with habitat.config.read_write(self.config):
             self.config.habitat.dataset.split = split
+            create_renderer = os.getenv("HABITAT_CREATE_RENDERER", "").strip().lower()
+            if create_renderer in {"1", "true", "yes", "on"}:
+                self.config.habitat.simulator.create_renderer = True
+            elif create_renderer in {"0", "false", "no", "off"}:
+                self.config.habitat.simulator.create_renderer = False
+            scene_light_setup = os.getenv("HABITAT_SCENE_LIGHT_SETUP", "").strip()
+            if scene_light_setup:
+                self.config.habitat.simulator.habitat_sim_v0.override_scene_light_defaults = True
+                self.config.habitat.simulator.habitat_sim_v0.scene_light_setup = scene_light_setup
             sim_gpu = getattr(args, "sim_gpu", None)
             if sim_gpu is not None:
                 self.config.habitat.simulator.habitat_sim_v0.gpu_device_id = int(sim_gpu)
@@ -416,7 +425,9 @@ class Evaluator:
                 }
             )
 
+        print(f"[EvalInit] before Env(config={config_path}, split={split})", flush=True)
         self.env = Env(config=self.config)
+        print("[EvalInit] after Env(config)", flush=True)
         if hasattr(self.agent, "set_env"):
             self.agent.set_env(self.env)
         self.idx = idx
@@ -532,15 +543,19 @@ class Evaluator:
         - reset
         - 相机视角对齐（俯视 30°）
         """
+        print(f"[EvalInitEpisode] before reset episode={getattr(episode, 'episode_id', '')}", flush=True)
         self.env.current_episode = episode
         observations = self.env.reset()
+        print(f"[EvalInitEpisode] after reset episode={getattr(episode, 'episode_id', '')}", flush=True)
         observations = self._repair_observation_render(observations, "reset")
 
         # === 初始高度（给 agent 用）===
         initial_height = self.env.sim.get_agent_state().position[1]
 
         for look_down_idx in range(self.init_look_down_steps):
+            print(f"[EvalInitEpisode] before init_look_down_{look_down_idx + 1}", flush=True)
             observations = self.env.step(Action.LOOK_DOWN.value)
+            print(f"[EvalInitEpisode] after init_look_down_{look_down_idx + 1}", flush=True)
             observations = self._repair_observation_render(
                 observations,
                 f"init_look_down_{look_down_idx + 1}",
@@ -612,6 +627,14 @@ class Evaluator:
                 flush=True,
             )
             current_dist = self.env.get_metrics().get("distance_to_goal", float("inf"))
+            current_metrics = self.env.get_metrics()
+            self._write_step_metrics(
+                episode=episode,
+                episode_instruction=episode_instruction,
+                step=step,
+                metrics=current_metrics,
+                min_distance=min(min_distance, current_dist),
+            )
             print(
                 f"[EvalStep] episode={episode.episode_id} step={step} after_get_metrics",
                 flush=True,
@@ -712,6 +735,23 @@ class Evaluator:
 
         return metrics
 
+    def _write_step_metrics(self, episode, episode_instruction: str, step: int, metrics: dict, min_distance: float):
+        path = os.path.join(self.output_path, "step_metrics.jsonl")
+        record = {
+            "scene_id": episode.scene_id.split("/")[-2],
+            "episode_id": str(episode.episode_id),
+            "step": int(step),
+            "distance_to_goal": float(metrics.get("distance_to_goal", float("inf"))),
+            "success": float(metrics.get("success", 0.0)),
+            "spl": float(metrics.get("spl", 0.0)),
+            "ndtw": float(metrics.get("ndtw", 0.0)),
+            "min_distance": float(min_distance),
+            "success_distance": float(self.config.habitat.task.measurements.success.success_distance),
+            "episode_instruction": episode_instruction,
+        }
+        with open(path, "a") as f:
+            f.write(json.dumps(record) + "\n")
+
     @staticmethod
     def _rgb_noise_stats(rgb):
         arr = np.asarray(rgb)
@@ -725,15 +765,31 @@ class Evaluator:
         hdiff = float(np.abs(np.diff(arr_i, axis=1)).mean())
         vdiff = float(np.abs(np.diff(arr_i, axis=0)).mean())
         std = float(arr.std(axis=(0, 1)).mean())
-        return hdiff, vdiff, std
+        mean = arr.mean(axis=(0, 1))
+        black_frac = float((arr < 5).all(axis=2).mean())
+        return {
+            "hdiff": hdiff,
+            "vdiff": vdiff,
+            "std": std,
+            "mean": [float(mean[0]), float(mean[1]), float(mean[2])],
+            "black_frac": black_frac,
+        }
 
     @classmethod
     def _is_corrupt_rgb(cls, rgb):
         stats = cls._rgb_noise_stats(rgb)
         if stats is None:
             return False
-        hdiff, vdiff, std = stats
-        return hdiff > 50.0 and vdiff > 50.0 and std > 55.0
+        hdiff = float(stats["hdiff"])
+        vdiff = float(stats["vdiff"])
+        std = float(stats["std"])
+        arr = np.asarray(rgb)
+        if arr.ndim == 3 and arr.shape[-1] == 4:
+            arr = arr[..., :3]
+        mean = arr.mean(axis=(0, 1)) if arr.ndim == 3 and arr.shape[-1] == 3 else np.asarray([0.0, 0.0, 0.0])
+        purple_like = float(mean[1]) < 12.0 and float(mean[0]) > 50.0 and float(mean[2]) > 50.0
+        almost_black = float(stats["black_frac"]) > 0.95
+        return (hdiff > 50.0 and vdiff > 50.0 and std > 55.0) or purple_like or almost_black
 
     def _repair_observation_render(self, observations, context):
         """Habitat reset/step can occasionally return an uninitialized RGB buffer.
@@ -744,37 +800,87 @@ class Evaluator:
         """
         if not isinstance(observations, dict) or "rgb" not in observations:
             return observations
-        if not Evaluator._is_corrupt_rgb(observations["rgb"]):
+        force_rerender = os.getenv("HABITAT_FORCE_RERENDER_RGB", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if not force_rerender and not Evaluator._is_corrupt_rgb(observations["rgb"]):
             return observations
 
         before = Evaluator._rgb_noise_stats(observations["rgb"])
-        max_attempts = int(os.getenv("HABITAT_RGB_REPAIR_ATTEMPTS", "50"))
+        max_attempts = int(os.getenv("HABITAT_RGB_REPAIR_ATTEMPTS", "8"))
+        fail_on_corrupt = os.getenv("HABITAT_FAIL_ON_CORRUPT_RGB", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         for attempt in range(1, max_attempts + 1):
             try:
-                fresh = self.env.sim.get_sensor_observations()
+                fresh = self._fresh_sensor_observations(attempt)
             except Exception as exc:
                 print(f"[Eval] RGB repair failed at {context}: {exc}")
+                if fail_on_corrupt:
+                    raise RuntimeError(f"RGB repair failed at {context}: {exc}") from exc
                 return observations
 
             fresh_rgb = fresh.get("rgb") if isinstance(fresh, dict) else None
             if fresh_rgb is None:
+                if fail_on_corrupt:
+                    raise RuntimeError(f"RGB repair at {context} returned no rgb on attempt {attempt}")
                 return observations
 
-            if not Evaluator._is_corrupt_rgb(fresh_rgb):
+            fresh_is_corrupt = Evaluator._is_corrupt_rgb(fresh_rgb)
+            if not fresh_is_corrupt:
                 repaired = dict(observations)
                 repaired["rgb"] = np.ascontiguousarray(fresh_rgb[..., :3] if fresh_rgb.ndim == 3 and fresh_rgb.shape[-1] == 4 else fresh_rgb)
                 if isinstance(fresh, dict) and "depth" in fresh:
                     repaired["depth"] = fresh["depth"]
                 after = Evaluator._rgb_noise_stats(repaired["rgb"])
-                print(
-                    f"[Eval] Repaired corrupt RGB at {context} on rerender {attempt}: "
-                    f"{before} -> {after}"
+                if force_rerender:
+                    print(
+                        f"[Eval] Forced RGB rerender at {context} on attempt {attempt}: "
+                        f"{before} -> {after}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[Eval] Repaired corrupt RGB at {context} on rerender {attempt}: "
+                        f"{before} -> {after}",
+                        flush=True,
                 )
                 return repaired
+            print(
+                f"[Eval] RGB repair attempt {attempt}/{max_attempts} still corrupt at {context}: "
+                f"{Evaluator._rgb_noise_stats(fresh_rgb)}",
+                flush=True,
+            )
 
         print(f"[Eval] WARNING: RGB still looks corrupt after rerender at {context}: {before}")
+        if fail_on_corrupt:
+            raise RuntimeError(f"RGB still corrupt after {max_attempts} rerenders at {context}: {before}")
         return observations
 
+    def _fresh_sensor_observations(self, attempt: int = 1):
+        use_observations_at = os.getenv("HABITAT_FORCE_OBSERVATIONS_AT", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        prefer_observations_at = use_observations_at and (attempt % 2 == 1)
+        if prefer_observations_at and hasattr(self.env.sim, "get_observations_at"):
+            state = self.env.sim.get_agent_state()
+            fresh = self.env.sim.get_observations_at(
+                position=state.position,
+                rotation=state.rotation,
+                keep_agent_at_new_pose=False,
+            )
+            if fresh is not None:
+                return fresh
+        return self.env.sim.get_sensor_observations()
 
     def _build_observation(self, observations, step_id, agent_height=None, metrics=None):
         if agent_height is None:
@@ -1027,6 +1133,11 @@ class LLMAgent(BaseAgent):
     def act(self, obs: Observation) -> Action:
 
         if self.local_actions:
+            print(
+                f"[LLMAgent] using cached local action={self.local_actions[0]} "
+                f"remaining={len(self.local_actions)} step={obs.step_id}",
+                flush=True,
+            )
             self.last_pixel_goal = None
             return Action(self.local_actions.pop(0))
 
@@ -1046,6 +1157,10 @@ class LLMAgent(BaseAgent):
 
         action_list = self.traj_client.query(req, update_history=True)
         actions = action_list.get("actions", [])
+        print(
+            f"[LLMAgent] server returned actions={actions} step={obs.step_id}",
+            flush=True,
+        )
         self.last_pixel_goal = action_list.get("pixel_goal", None)
         if action_list.get("oracle_goal_gps") is not None:
             self._start_dagger_oracle_rejoin(action_list)

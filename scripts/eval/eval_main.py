@@ -79,6 +79,12 @@ def parse_args():
     parser.add_argument("--max_new_tokens", type=int, default=1024)
     parser.add_argument("--max_eval_episodes", type=int, default=0, help="0 means evaluate all episodes")
     parser.add_argument(
+        "--max_steps",
+        type=int,
+        default=int(os.getenv("HABITAT_EVAL_MAX_STEPS", "500")),
+        help="Maximum Habitat actions per episode.",
+    )
+    parser.add_argument(
         "--eval_episode_ids",
         type=str,
         default="",
@@ -157,6 +163,7 @@ def main():
         output_path=args.output_path,
         args=args,
         agent=agent,
+        max_steps=args.max_steps,
         idx=get_rank(),
         env_num=get_world_size(),
     )
