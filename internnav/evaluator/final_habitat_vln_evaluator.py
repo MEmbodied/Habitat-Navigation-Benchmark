@@ -769,7 +769,7 @@ class Evaluator:
         return dict(metadata)
 
     def _draw_dagger_path_on_frame(self, frame, metrics, *, prev_map_coord, action_vis):
-        if "dagger_correction_applied" not in action_vis:
+        if not bool(action_vis.get("dagger_correction_applied", False)):
             return frame
         if not isinstance(metrics, dict):
             return frame
@@ -1141,9 +1141,16 @@ class LLMAgent(BaseAgent):
         self._dagger_oracle_hold_lookahead = max(1, int(os.getenv("XNAV_DAGGER_ORACLE_HOLD_LOOKAHEAD_POINTS", "2")))
         self._dagger_oracle_stop_at_final = os.getenv("XNAV_DAGGER_ORACLE_STOP_AT_FINAL", "1") != "0"
         self._dagger_oracle_phase = None
+        self._dagger_oracle_source = "dagger"
         self._dagger_oracle_follower = None
         self._dagger_pending_oracle_response = None
         self._dagger_post_error_student_remaining = 0
+        self._query_server_during_oracle = os.getenv("HABITAT_QUERY_SERVER_DURING_ORACLE", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         self.last_action_metadata = {}
 
     def set_env(self, env):
@@ -1171,6 +1178,7 @@ class LLMAgent(BaseAgent):
         self._dagger_oracle_remaining = 0
         self._dagger_oracle_hold_remaining = 0
         self._dagger_oracle_phase = None
+        self._dagger_oracle_source = "dagger"
         self._dagger_oracle_follower = None
         self._dagger_pending_oracle_response = None
         self._dagger_post_error_student_remaining = 0
@@ -1205,9 +1213,11 @@ class LLMAgent(BaseAgent):
             self._dagger_oracle_remaining = 0
             self._dagger_oracle_hold_remaining = 0
             self._dagger_oracle_phase = None
+            self._dagger_oracle_source = "dagger"
             self._dagger_oracle_follower = None
             return
         radius = float(action_response.get("oracle_goal_radius", 0.35))
+        self._dagger_oracle_source = "eval_gt_low_policy" if action_response.get("eval_gt_low_policy") else "dagger"
         self._dagger_oracle_goal_world = np.asarray(goal_world, dtype=np.float32)
         self._dagger_oracle_goal_index = int(goal_index) if goal_index is not None else None
         self._dagger_oracle_remaining = int(action_response.get("oracle_max_steps", 80))
@@ -1215,7 +1225,7 @@ class LLMAgent(BaseAgent):
         self._dagger_oracle_phase = "rejoin"
         self._dagger_oracle_follower = ShortestPathFollower(self.env.sim, radius, False)
         print(
-            f"[LLMAgent] DAgger Habitat oracle rejoin start: "
+            f"[LLMAgent] {self._oracle_log_label()} rejoin start: "
             f"goal_gps={goal_gps} goal_index={goal_index} "
             f"goal_world={self._dagger_oracle_goal_world.tolist()} "
             f"radius={radius} max_steps={self._dagger_oracle_remaining} "
@@ -1233,7 +1243,24 @@ class LLMAgent(BaseAgent):
         self._dagger_oracle_remaining = 0
         self._dagger_oracle_hold_remaining = 0
         self._dagger_oracle_phase = None
+        self._dagger_oracle_source = "dagger"
         self._dagger_oracle_follower = None
+
+    def _oracle_log_label(self) -> str:
+        if getattr(self, "_dagger_oracle_source", "") == "eval_gt_low_policy":
+            return "Eval GT low-policy Habitat oracle"
+        return "DAgger Habitat oracle"
+
+    def _oracle_action_metadata(self, phase: str) -> dict:
+        if getattr(self, "_dagger_oracle_source", "") == "eval_gt_low_policy":
+            return {
+                "eval_gt_low_policy": True,
+                "eval_gt_low_policy_phase": phase,
+            }
+        return {
+            "dagger_correction_applied": True,
+            "dagger_failure_type": f"gt_divergence_habitat_oracle_{phase}",
+        }
 
     def _queue_dagger_oracle_after_student_rollout(self, action_response: dict) -> bool:
         if not isinstance(action_response, dict) or action_response.get("oracle_goal_gps") is None:
@@ -1245,8 +1272,9 @@ class LLMAgent(BaseAgent):
         self._dagger_pending_oracle_response = dict(action_response)
         if self._dagger_post_error_student_remaining <= 0:
             self._dagger_post_error_student_remaining = post_error_steps
+        label = "Eval GT low-policy Habitat oracle" if action_response.get("eval_gt_low_policy") else "DAgger Habitat oracle"
         print(
-            f"[LLMAgent] DAgger queued oracle recovery after student rollout: "
+            f"[LLMAgent] {label} queued after student rollout: "
             f"remaining={self._dagger_post_error_student_remaining} "
             f"goal_index={action_response.get('oracle_goal_progress_index')}"
         )
@@ -1259,7 +1287,8 @@ class LLMAgent(BaseAgent):
             return False
         action_response = self._dagger_pending_oracle_response
         self._dagger_pending_oracle_response = None
-        print("[LLMAgent] DAgger post-error student rollout done; starting oracle recovery")
+        label = "Eval GT low-policy Habitat oracle" if action_response.get("eval_gt_low_policy") else "DAgger Habitat oracle"
+        print(f"[LLMAgent] post-error student rollout done; starting {label}")
         self._start_dagger_oracle_rejoin(action_response)
         return True
 
@@ -1268,14 +1297,22 @@ class LLMAgent(BaseAgent):
             return
         if self._dagger_post_error_student_remaining > 0:
             self._dagger_post_error_student_remaining -= 1
+        label = (
+            "Eval GT low-policy Habitat oracle"
+            if self._dagger_pending_oracle_response.get("eval_gt_low_policy")
+            else "DAgger Habitat oracle"
+        )
         print(
-            f"[LLMAgent] DAgger post-error student action executed; "
+            f"[LLMAgent] {label} post-error student action executed; "
             f"remaining={self._dagger_post_error_student_remaining}"
         )
 
     @staticmethod
     def _dagger_execution_metadata(metadata: dict, *, correction_applied: bool) -> dict:
         out = dict(metadata or {})
+        if out.get("eval_gt_low_policy"):
+            out["eval_gt_low_policy_phase"] = "post_error_student"
+            return out
         out["dagger_correction_applied"] = bool(correction_applied)
         if not correction_applied:
             out["dagger_execution_phase"] = "post_error_student"
@@ -1302,7 +1339,7 @@ class LLMAgent(BaseAgent):
         self._dagger_oracle_goal_world = target_world
         self._dagger_oracle_phase = "hold"
         print(
-            f"[LLMAgent] DAgger Habitat oracle hold target: "
+            f"[LLMAgent] {self._oracle_log_label()} hold target: "
             f"goal_index={target_idx} goal_world={target_world.tolist()} "
             f"hold_remaining={self._dagger_oracle_hold_remaining}"
         )
@@ -1354,7 +1391,7 @@ class LLMAgent(BaseAgent):
         except Exception:
             pass
         print(
-            f"[LLMAgent] DAgger Habitat oracle official goal target: "
+            f"[LLMAgent] {self._oracle_log_label()} official goal target: "
             f"goal_world={target_world.tolist()} remaining={self._dagger_oracle_remaining}"
         )
         return True
@@ -1369,41 +1406,36 @@ class LLMAgent(BaseAgent):
                 self._reset_dagger_oracle()
                 return None
             if self._dagger_oracle_phase == "hold" and self._dagger_oracle_hold_remaining <= 0:
-                print("[LLMAgent] DAgger Habitat oracle hold budget exhausted")
+                print(f"[LLMAgent] {self._oracle_log_label()} hold budget exhausted")
                 self._reset_dagger_oracle()
                 return None
             action = self._dagger_oracle_follower.get_next_action(self._dagger_oracle_goal_world)
             if action is None or int(action) == Action.STOP.value:
                 phase = self._dagger_oracle_phase or "rejoin"
-                print(f"[LLMAgent] DAgger Habitat oracle {phase} target reached")
+                print(f"[LLMAgent] {self._oracle_log_label()} {phase} target reached")
                 if self._dagger_oracle_hold_remaining > 0 and self._advance_dagger_oracle_hold_target():
                     continue
                 if self._dagger_oracle_stop_at_final and self._dagger_oracle_at_final_reference():
                     if not self._dagger_oracle_success_reached() and self._advance_dagger_oracle_official_goal_target():
                         continue
-                    print("[LLMAgent] DAgger Habitat oracle success/final target reached; issuing STOP")
+                    print(f"[LLMAgent] {self._oracle_log_label()} success/final target reached; issuing STOP")
+                    metadata = self._oracle_action_metadata("final_stop")
                     self._reset_dagger_oracle()
-                    self.last_action_metadata = {
-                        "dagger_correction_applied": True,
-                        "dagger_failure_type": "gt_divergence_habitat_oracle_final_stop",
-                    }
+                    self.last_action_metadata = metadata
                     return int(Action.STOP.value)
-                print("[LLMAgent] DAgger Habitat oracle rejoin done")
+                print(f"[LLMAgent] {self._oracle_log_label()} rejoin done")
                 self._reset_dagger_oracle()
                 return None
             self._dagger_oracle_remaining -= 1
             if self._dagger_oracle_phase == "hold":
                 self._dagger_oracle_hold_remaining -= 1
             print(
-                f"[LLMAgent] DAgger Habitat oracle action={int(action)} "
+                f"[LLMAgent] {self._oracle_log_label()} action={int(action)} "
                 f"phase={self._dagger_oracle_phase or 'rejoin'} "
                 f"remaining={self._dagger_oracle_remaining} "
                 f"hold_remaining={self._dagger_oracle_hold_remaining}"
             )
-            self.last_action_metadata = {
-                "dagger_correction_applied": True,
-                "dagger_failure_type": "gt_divergence_habitat_oracle_rejoin",
-            }
+            self.last_action_metadata = self._oracle_action_metadata("rejoin")
             return int(action)
 
     @staticmethod
@@ -1434,16 +1466,17 @@ class LLMAgent(BaseAgent):
             self.last_action_metadata = {}
             return Action(self.local_actions.pop(0))
 
-        oracle_action = self._next_dagger_oracle_action()
-        if oracle_action is not None:
-            self.last_pixel_goal = None
-            return Action(oracle_action)
-
-        if self._maybe_start_pending_dagger_oracle():
+        if not self._query_server_during_oracle:
             oracle_action = self._next_dagger_oracle_action()
             if oracle_action is not None:
                 self.last_pixel_goal = None
                 return Action(oracle_action)
+
+            if self._maybe_start_pending_dagger_oracle():
+                oracle_action = self._next_dagger_oracle_action()
+                if oracle_action is not None:
+                    self.last_pixel_goal = None
+                    return Action(oracle_action)
 
         req = build_traj_request(
             obs,
@@ -1467,7 +1500,21 @@ class LLMAgent(BaseAgent):
         self.last_pixel_goal = action_list.get("pixel_goal", None)
         queued_oracle = False
         if action_list.get("oracle_goal_gps") is not None:
-            queued_oracle = self._queue_dagger_oracle_after_student_rollout(action_list)
+            oracle_already_active = (
+                self._query_server_during_oracle
+                and (
+                    self._dagger_oracle_follower is not None
+                    or self._dagger_pending_oracle_response is not None
+                )
+            )
+            if oracle_already_active:
+                active_label = self._oracle_log_label()
+                print(
+                    f"[LLMAgent] keeping active {active_label} while still querying server",
+                    flush=True,
+                )
+            else:
+                queued_oracle = self._queue_dagger_oracle_after_student_rollout(action_list)
 
         if not actions:
             if queued_oracle:
