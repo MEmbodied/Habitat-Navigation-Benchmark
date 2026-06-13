@@ -23,6 +23,13 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
     def _save_client_observation(self, obs: dict):
         if not self.debug_output_path:
             return
+        if os.getenv("HABITAT_SAVE_CLIENT_OBSERVATIONS", "0").strip().lower() not in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            return
         try:
             rgb = obs.get("rgb")
             if rgb is None:
