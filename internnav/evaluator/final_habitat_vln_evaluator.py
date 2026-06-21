@@ -53,6 +53,78 @@ from internnav.utils.dist import *  # noqa: F403
 
 DEFAULT_IMAGE_TOKEN = "<image>"
 
+DEFAULT_CLOSED_LOOP_THRESHOLDS_M = (1.0, 3.0)
+
+
+def _safe_float(value: Any, default: float = float("nan")) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _finite_or_none(value: Any) -> Optional[float]:
+    val = _safe_float(value)
+    return val if np.isfinite(val) else None
+
+
+def _success_weighted_path_length(success: float, shortest_path_length: float, path_length: float) -> float:
+    if success <= 0.0:
+        return 0.0
+    if shortest_path_length <= 0.0 or not np.isfinite(shortest_path_length):
+        return 0.0
+    denom = max(float(path_length), float(shortest_path_length))
+    if denom <= 0.0 or not np.isfinite(denom):
+        return 0.0
+    return float(success) * float(shortest_path_length) / denom
+
+
+def _metrics_at_threshold(rows: list[dict[str, Any]], threshold_m: float) -> dict[str, float]:
+    if not rows:
+        return {
+            "sr": 0.0,
+            "spl": 0.0,
+            "os": 0.0,
+            "ne": 0.0,
+            "count": 0,
+            "threshold_m": float(threshold_m),
+        }
+
+    sr_vals: list[float] = []
+    spl_vals: list[float] = []
+    os_vals: list[float] = []
+    ne_vals: list[float] = []
+    for row in rows:
+        final_distance = _safe_float(row.get("ne"), float("inf"))
+        min_distance = _safe_float(row.get("min_distance"), final_distance)
+        path_length = _safe_float(row.get("path_length"), float("nan"))
+        shortest_path_length = _safe_float(row.get("shortest_path_length"), float("nan"))
+        stopped = bool(row.get("stopped", float(row.get("success", 0.0)) > 0.0))
+        row_success_distance = _safe_float(row.get("success_distance"), float("nan"))
+
+        if np.isfinite(row_success_distance) and abs(row_success_distance - threshold_m) < 1e-6:
+            success = _safe_float(row.get("success"), 0.0)
+            oracle_success = _safe_float(row.get("os"), 0.0)
+            spl = _safe_float(row.get("spl"), 0.0)
+        else:
+            success = float(stopped and final_distance <= threshold_m)
+            oracle_success = float(min_distance < threshold_m)
+            spl = _success_weighted_path_length(success, shortest_path_length, path_length)
+
+        sr_vals.append(success)
+        spl_vals.append(spl)
+        os_vals.append(oracle_success)
+        ne_vals.append(final_distance)
+
+    return {
+        "sr": float(sum(sr_vals) / len(sr_vals)),
+        "spl": float(sum(spl_vals) / len(spl_vals)),
+        "os": float(sum(os_vals) / len(os_vals)),
+        "ne": float(sum(ne_vals) / len(ne_vals)),
+        "count": len(rows),
+        "threshold_m": float(threshold_m),
+    }
+
 def build_traj_request(obs, instruction: str, rel_height: float):
     return {
         "rgb": obs.rgb,
@@ -446,6 +518,7 @@ class Evaluator:
         self.oss = []
         self.nes = []
         self.steps = []
+        self._last_result_record = None
 
         sensor_cfg = self.config.habitat.simulator.agents.main_agent.sim_sensors
 
@@ -570,6 +643,31 @@ class Evaluator:
 
         return observations, initial_height
 
+    @staticmethod
+    def _episode_shortest_path_length(episode) -> Optional[float]:
+        candidates = []
+        info = getattr(episode, "info", None)
+        if isinstance(info, dict):
+            candidates.extend(
+                [
+                    info.get("geodesic_distance"),
+                    info.get("shortest_path_length"),
+                    info.get("shortest_path_distance"),
+                ]
+            )
+        candidates.extend(
+            [
+                getattr(episode, "geodesic_distance", None),
+                getattr(episode, "shortest_path_length", None),
+                getattr(episode, "shortest_path_distance", None),
+            ]
+        )
+        for candidate in candidates:
+            value = _finite_or_none(candidate)
+            if value is not None and value >= 0.0:
+                return value
+        return None
+
     def run_episode(self, episode):
         # ===== Episode init =====
         observations, initial_height = self._init_episode(episode)
@@ -586,6 +684,9 @@ class Evaluator:
         self.vis_frames = []
 
         min_distance = float("inf")
+        path_length = 0.0
+        prev_position = np.asarray(self.env.sim.get_agent_state().position, dtype=np.float64)
+        last_action_value = None
 
         while not done and step < self.max_steps:
             if self.env.episode_over:
@@ -617,6 +718,7 @@ class Evaluator:
                 flush=True,
             )
             # === 执行动作 ===
+            last_action_value = int(action.value)
             observations = self.env.step(action.value)
             print(
                 f"[EvalStep] episode={episode.episode_id} step={step} "
@@ -624,6 +726,12 @@ class Evaluator:
                 flush=True,
             )
             observations = self._repair_observation_render(observations, f"step{step}_action{action.value}")
+            current_position = np.asarray(self.env.sim.get_agent_state().position, dtype=np.float64)
+            if current_position.shape == prev_position.shape:
+                delta = float(np.linalg.norm(current_position - prev_position))
+                if np.isfinite(delta):
+                    path_length += delta
+            prev_position = current_position
             done = self.env.episode_over
             step += 1
 
@@ -639,6 +747,7 @@ class Evaluator:
                 step=step,
                 metrics=current_metrics,
                 min_distance=min(min_distance, current_dist),
+                path_length=path_length,
             )
             print(
                 f"[EvalStep] episode={episode.episode_id} step={step} after_get_metrics",
@@ -683,6 +792,12 @@ class Evaluator:
         oracle_success = float(
             min_distance < self.config.habitat.task.measurements.success.success_distance
         )
+        stopped = bool(last_action_value == Action.STOP.value)
+        if not np.isfinite(min_distance):
+            min_distance = ne
+        shortest_path_length = self._episode_shortest_path_length(episode)
+        if shortest_path_length is None:
+            shortest_path_length = float("nan")
 
         self.sucs.append(success)
         self.spls.append(spl)
@@ -697,8 +812,14 @@ class Evaluator:
             "spl": spl,
             "os": oracle_success,   
             "ne": ne,
+            "final_distance_to_goal": ne,
+            "min_distance": float(min_distance),
             "ndtw": ndtw_score,
             "success_distance": float(self.config.habitat.task.measurements.success.success_distance),
+            "path_length": float(path_length),
+            "shortest_path_length": float(shortest_path_length),
+            "stopped": bool(stopped),
+            "last_action": int(last_action_value) if last_action_value is not None else None,
             "steps": step,
             "episode_instruction": episode_instruction,
             "dataset_episode_instruction": (
@@ -711,6 +832,7 @@ class Evaluator:
 
         with open(os.path.join(self.output_path, "result.json"), "a") as f:
             f.write(json.dumps(result) + "\n")
+        self._last_result_record = result
 
         print(
             f"[Eval] Episode {str(episode.episode_id)} finished | "
@@ -830,7 +952,15 @@ class Evaluator:
             cv2.putText(frame, label, (x0, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 2, cv2.LINE_AA)
         return frame
 
-    def _write_step_metrics(self, episode, episode_instruction: str, step: int, metrics: dict, min_distance: float):
+    def _write_step_metrics(
+        self,
+        episode,
+        episode_instruction: str,
+        step: int,
+        metrics: dict,
+        min_distance: float,
+        path_length: float,
+    ):
         path = os.path.join(self.output_path, "step_metrics.jsonl")
         record = {
             "scene_id": episode.scene_id.split("/")[-2],
@@ -841,6 +971,7 @@ class Evaluator:
             "spl": float(metrics.get("spl", 0.0)),
             "ndtw": float(metrics.get("ndtw", 0.0)),
             "min_distance": float(min_distance),
+            "path_length": float(path_length),
             "success_distance": float(self.config.habitat.task.measurements.success.success_distance),
             "episode_instruction": episode_instruction,
         }
@@ -1072,6 +1203,7 @@ class Evaluator:
     def _summarize_results(self):
         import json, os
 
+        rows = []
         sucs, spls, oss, nes = [], [], [], []
 
         result_path = os.path.join(self.output_path, "result.json")
@@ -1079,18 +1211,38 @@ class Evaluator:
         with open(result_path) as f:
             for line in f:
                 r = json.loads(line)
+                rows.append(r)
                 sucs.append(r["success"])
                 spls.append(r["spl"])
                 oss.append(r["os"])
                 nes.append(r["ne"])
 
+        threshold_metrics = {
+            f"{threshold:g}m": _metrics_at_threshold(rows, threshold)
+            for threshold in DEFAULT_CLOSED_LOOP_THRESHOLDS_M
+        }
+        native_threshold = float(self.config.habitat.task.measurements.success.success_distance)
         summary = {
             "sucs_all": sum(sucs) / len(sucs),
             "spls_all": sum(spls) / len(spls),
             "oss_all": sum(oss) / len(oss),
             "nes_all": sum(nes) / len(nes),
             "length": len(sucs),
-            "success_distance": float(self.config.habitat.task.measurements.success.success_distance),
+            "success_distance": native_threshold,
+            "metrics_by_threshold": threshold_metrics,
+        }
+        metrics_summary = {
+            "native_success_distance_m": native_threshold,
+            "thresholds_m": list(DEFAULT_CLOSED_LOOP_THRESHOLDS_M),
+            "metrics_by_threshold": threshold_metrics,
+            "legacy": {
+                "sucs_all": summary["sucs_all"],
+                "spls_all": summary["spls_all"],
+                "oss_all": summary["oss_all"],
+                "nes_all": summary["nes_all"],
+                "length": summary["length"],
+                "success_distance": native_threshold,
+            },
         }
 
         print("===== EVAL SUMMARY =====")
@@ -1098,6 +1250,8 @@ class Evaluator:
 
         with open(os.path.join(self.output_path, "summary.json"), "w") as f:
             json.dump(summary, f, indent=2)
+        with open(os.path.join(self.output_path, "metrics_summary.json"), "w") as f:
+            json.dump(metrics_summary, f, indent=2)
 
 class LLMAgent(BaseAgent):
     def __init__(
