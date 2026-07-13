@@ -56,6 +56,8 @@ DEFAULT_IMAGE_TOKEN = "<image>"
 DEFAULT_CLOSED_LOOP_THRESHOLDS_M = (1.0, 3.0)
 
 
+# Habitat's base RGB sensor always reports the UUID "rgb". Distinct UUIDs are
+# required for multiple simultaneous cameras in one SensorSuite.
 def _safe_float(value: Any, default: float = float("nan")) -> float:
     try:
         return float(value)
@@ -720,6 +722,9 @@ class Evaluator:
             # === 执行动作 ===
             last_action_value = int(action.value)
             observations = self.env.step(action.value)
+            record_executed_action = getattr(self.agent, "record_executed_action", None)
+            if callable(record_executed_action):
+                record_executed_action(action.value)
             print(
                 f"[EvalStep] episode={episode.episode_id} step={step} "
                 f"action={action.value} after_env_step",
@@ -1326,6 +1331,7 @@ class LLMAgent(BaseAgent):
             "on",
         }
         self.last_action_metadata = {}
+        self._executed_actions_since_query = []
 
     def set_env(self, env):
         self.env = env
@@ -1354,8 +1360,19 @@ class LLMAgent(BaseAgent):
         self._dagger_oracle_source = "dagger"
         self._dagger_oracle_follower = None
         self.last_action_metadata = {}
+        self._executed_actions_since_query = []
 
         self.last_pixel_goal = None
+
+    def record_executed_action(self, action: int):
+        self._executed_actions_since_query.append(int(action))
+
+    def _query_trajectory_server(self, request: dict, **kwargs):
+        request_payload = dict(request)
+        request_payload["executed_actions"] = list(self._executed_actions_since_query)
+        response = self.traj_client.query(request_payload, **kwargs)
+        self._executed_actions_since_query.clear()
+        return response
 
     def _dagger_goal_world_from_response(self, goal_gps, goal_index=None):
         if self.env is None:
@@ -1522,11 +1539,13 @@ class LLMAgent(BaseAgent):
         req["min_depth"] = self.min_depth
         req["max_depth"] = self.max_depth
 
-        action_list = self.traj_client.query(req, update_history=True)
+        action_list = self._query_trajectory_server(req, update_history=True)
         actions = action_list.get("actions", [])
         response_metadata = self._dagger_metadata_from_response(action_list)
         print(
-            f"[LLMAgent] server returned actions={actions} step={obs.step_id}",
+            f"[LLMAgent] client resolved actions={actions} step={obs.step_id} "
+            f"transport={action_list.get('action_transport', 'unknown')} "
+            f"execute_horizon={action_list.get('chunk_execute_horizon', 'n/a')}",
             flush=True,
         )
         self.last_pixel_goal = action_list.get("pixel_goal", None)
@@ -1560,7 +1579,9 @@ class LLMAgent(BaseAgent):
             # 注意：这里的 step 不会增加外部 Evaluator 的 step 计数，因为我们在 Agent 内部
             # 但我们需要从 env 获取新的 observation
             obs_down_1 = self.env.step(Action.LOOK_DOWN.value)
+            self.record_executed_action(Action.LOOK_DOWN.value)
             obs_down_2 = self.env.step(Action.LOOK_DOWN.value) # 这张是地板图
+            self.record_executed_action(Action.LOOK_DOWN.value)
             
             # B. 构造地板图请求
             # 我们需要把 obs_down_2 封装成 req 格式
@@ -1585,7 +1606,7 @@ class LLMAgent(BaseAgent):
             # C. 第二次查询 Server (强制 NavDP)
             # [关键] update_history=False !!! 不让地板图进历史 !!!
             # Server 会识别 force_navdp=True (由 Client 根据 update_history=False 自动推导)
-            traj_result = self.traj_client.query(req_floor, update_history=False, do_resize=False)
+            traj_result = self._query_trajectory_server(req_floor, update_history=False, do_resize=False)
             response_metadata = self._dagger_metadata_from_response(traj_result)
             
             nav_actions = traj_result.get("actions", [])
@@ -1593,7 +1614,9 @@ class LLMAgent(BaseAgent):
             
             # D. 内部执行两次抬头 (恢复平视)
             self.env.step(Action.LOOK_UP.value)
+            self.record_executed_action(Action.LOOK_UP.value)
             self.env.step(Action.LOOK_UP.value)
+            self.record_executed_action(Action.LOOK_UP.value)
             
             # E. 处理返回的动作
             # Server 之前返回的是 [4, 4, move, move...] (在你的旧 Server 代码里)

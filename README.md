@@ -45,3 +45,21 @@ python scripts/eval/eval_main.py --model_path /data/sjh/GR00T-Internva/output_ua
 r2r:python scripts/eval/eval_main.py --habitat_config_path scripts/eval/configs/our_benchmark_config_sub_r2r.yaml --gr00t_port 9000 --output_path /data/sjh/InternNav/output --save_video --num_history 12
 
 rxr:python scripts/eval/eval_main.py --habitat_config_path scripts/eval/configs/our_benchmark_config_sub_rxr.yaml --gr00t_port 9000 --output_path /data/sjh/InternNav/output --save_video --num_history 12
+
+## xNav HTTP action contract
+
+`internnav/evaluator/HTTPTrajectoryClient.py` supports both response forms:
+
+- Legacy Habitat responses with an `actions` list are executed unchanged.
+- Canonical continuous responses use `schema_version=2` and carry a full `continuous_action[16][4]` chunk plus
+  `chunk_execute_horizon`. The client reconstructs that prefix with
+  `canonical_relative_v1` body-frame SE(2) composition, then converts it to native
+  Habitat actions locally.
+
+Each observation advertises `client_capabilities` (including
+`high_policy_replan_ack_v1`) for server-side negotiation and
+includes `executed_actions`, the discrete actions successfully executed since the
+previous HTTP query. STOP remains Habitat action `0`; oracle-goal responses keep
+using the local `ShortestPathFollower`; control-only replan responses are ACKed and
+retried without executing an environment action. Protocol/observation errors abort
+the rollout instead of being interpreted as a normal STOP.

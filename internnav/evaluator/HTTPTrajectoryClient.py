@@ -1,4 +1,10 @@
-#本文件仅用于连接，主要职责为将evaluator 里产生的observation dict，通过 HTTP 发给外部 Trajectory Server，并把返回结果还原成 Python 对象
+"""HTTP bridge plus client-side execution for xNav Habitat evaluation.
+
+The client advertises its response capabilities, reconstructs canonical SE(2)
+chunks, and converts them to Habitat-native discrete actions. Legacy server
+``actions`` responses remain supported during the migration window.
+"""
+
 import requests
 import os
 from internnav.evaluator.final_habitat_vln_evaluator import BaseTrajectoryClient
@@ -8,7 +14,101 @@ import torch
 from datetime import datetime
 from pathlib import Path
 from PIL import Image
+
+from internnav.evaluator.canonical_action import (
+    CLIENT_CAPABILITIES,
+    habitat_actions_from_response,
+)
+
 json_numpy.patch()
+
+_MAX_REPLAN_ROUNDS = 4
+_MAX_REPLAN_ACK_POST_ATTEMPTS = 3
+
+_RESPONSE_METADATA_KEYS = (
+    "action_transport",
+    "schema_version",
+    "control_mode",
+    "action_horizon",
+    "chunk_execute_horizon",
+    "oracle_goal_gps",
+    "oracle_goal_progress_index",
+    "oracle_goal_radius",
+    "oracle_max_steps",
+    "post_error_student_steps",
+    "low_policy_mode",
+    "eval_gt_low_policy",
+    "eval_gt_low_policy_stop",
+    "eval_gt_low_policy_phase",
+    "eval_gt_final_dist_m",
+    "eval_gt_progress_index",
+    "eval_gt_low_policy_fallback",
+    "dagger_failure_type",
+    "dagger_correction_weight",
+    "dagger_student_actions_discrete",
+    "dagger_teacher_actions_discrete",
+    "dagger_final_actions_discrete",
+    "dagger_correction_applied",
+)
+
+
+def _replan_ack(result: dict) -> dict:
+    event = result.get("control_event")
+    if not isinstance(event, dict) or event.get("type") != "high_policy_replan":
+        raise ValueError(
+            "replan_required response must include control_event.type="
+            "'high_policy_replan'"
+        )
+    token = str(event.get("token") or "").strip()
+    if not token:
+        raise ValueError("replan_required control_event must include a non-empty token")
+    return {
+        "type": "high_policy_replan_ack",
+        "token": token,
+    }
+
+
+def _post_act(url: str, payload: dict, *, timeout: float):
+    observation = payload.get("observation")
+    control_event = observation.get("control_event") if isinstance(observation, dict) else None
+    is_replan_ack = bool(
+        isinstance(control_event, dict)
+        and control_event.get("type") == "high_policy_replan_ack"
+    )
+    attempts = _MAX_REPLAN_ACK_POST_ATTEMPTS if is_replan_ack else 1
+    body = json_numpy.dumps(payload)
+    for attempt in range(attempts):
+        try:
+            response = requests.post(
+                url,
+                data=body,
+                headers={"Content-Type": "application/json"},
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            return response
+        except requests.RequestException as exc:
+            status_code = getattr(getattr(exc, "response", None), "status_code", None)
+            retryable = status_code is None or int(status_code) >= 500
+            if not is_replan_ack or not retryable or attempt + 1 >= attempts:
+                raise
+    raise RuntimeError("unreachable replan ACK retry state")
+
+
+def _action_response(result: dict, actions: list[int], replan_rounds: int) -> dict:
+    response = {
+        "actions": actions,
+        "pixel_goal": result.get("pixel_goal", None),
+        "replan_rounds": replan_rounds,
+        "action_transport": result.get(
+            "action_transport",
+            "chunk" if "continuous_action" in result else "discrete",
+        ),
+    }
+    for key in _RESPONSE_METADATA_KEYS:
+        if key in result:
+            response[key] = result[key]
+    return response
 
 #更换模型只需要添加并调用一个新的类即可，以下面这个为例
 class Gr00tTrajectoryClient(BaseTrajectoryClient):
@@ -97,6 +197,9 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
         the server side.  Send an explicit contiguous RGB copy.
         """
         obs_payload = dict(obs)
+        obs_payload["client_capabilities"] = {
+            key: list(values) for key, values in CLIENT_CAPABILITIES.items()
+        }
         rgb = obs_payload.get("rgb")
         if rgb is not None:
             arr = np.asarray(rgb)
@@ -141,49 +244,44 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
         if self.debug_output_path:
             payload["debug_output_path"] = self.debug_output_path
             self._save_client_observation(obs_payload)
-        # 1. 使用 HTTP 发送
-        resp = requests.post(
-            self.url,
-            data=json_numpy.dumps(payload),  
-            headers={"Content-Type": "application/json"},
-            timeout=self.timeout,
-        )
-        resp.raise_for_status()
+        # 1. 使用 HTTP 发送；控制响应在同一 observation 上透明 ACK 后重试。
+        original_obs_payload = dict(obs_payload)
+        replan_rounds = 0
+        while True:
+            payload["observation"] = obs_payload
+            resp = _post_act(
+                self.url,
+                payload,
+                timeout=self.timeout,
+            )
 
-        # 2. 还原返回值
-        result = json_numpy.loads(resp.text)
-
-        if isinstance(result, str):
-            result = json_numpy.loads(result)
+            # 2. 还原返回值
+            result = json_numpy.loads(resp.text)
+            if isinstance(result, str):
+                result = json_numpy.loads(result)
+            if not isinstance(result, dict):
+                raise ValueError(f"unexpected /act response: {type(result)!r}")
+            if result.get("error"):
+                raise RuntimeError(f"policy server rejected observation: {result['error']}")
+            if not bool(result.get("replan_required", False)):
+                break
+            if replan_rounds >= _MAX_REPLAN_ROUNDS:
+                raise RuntimeError(
+                    "policy server exceeded the maximum of "
+                    f"{_MAX_REPLAN_ROUNDS} transparent replan rounds"
+                )
+            obs_payload = dict(original_obs_payload)
+            obs_payload["control_event"] = _replan_ack(result)
+            replan_rounds += 1
             
-        if "actions" in result:
-            response = {
-                "actions": result.get("actions", []),
-                "pixel_goal": result.get("pixel_goal", None),
-            }
-            for key in (
-                "oracle_goal_gps",
-                "oracle_goal_progress_index",
-                "oracle_goal_radius",
-                "oracle_max_steps",
-                "post_error_student_steps",
-                "low_policy_mode",
-                "eval_gt_low_policy",
-                "eval_gt_low_policy_stop",
-                "eval_gt_low_policy_phase",
-                "eval_gt_final_dist_m",
-                "eval_gt_progress_index",
-                "eval_gt_low_policy_fallback",
-                "dagger_failure_type",
-                "dagger_correction_weight",
-                "dagger_student_actions_discrete",
-                "dagger_teacher_actions_discrete",
-                "dagger_final_actions_discrete",
-                "dagger_correction_applied",
-            ):
-                if key in result:
-                    response[key] = result[key]
-            return response
+        if (
+            "actions" in result
+            or "continuous_action" in result
+            or bool(result.get("stop", False))
+            or result.get("oracle_goal_gps") is not None
+        ):
+            actions = habitat_actions_from_response(result)
+            return _action_response(result, actions, replan_rounds)
         
         # 3. 获取 delta poses 
         dp_actions = result["action"]
@@ -201,9 +299,7 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
             # 如果actions_list 为空，正在追加默认动作 [1] 以维持运行。
             actions = [1]
         
-        return {
-            "actions": actions
-        }
+        return _action_response(result, actions, replan_rounds)
 
 def traj_to_actions_Gr00t(dp_actions,use_discrate_action=True):
     def reconstruct_xy_from_delta(delta_xyt):

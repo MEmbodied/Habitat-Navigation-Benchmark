@@ -11,3 +11,15 @@ uvicorn InternNav.scripts.eval.server_Gr00t:app \
     --port 9000
 2.接着运行：
 python scripts/eval/eval_main.py --model_path /data/sjh/GR00T-Internva/output_uav/checkpoint-300000 --continuous_traj --output_path result/Gr00t/val_unseen_32traj_8steps --save_video
+
+## xNav HTTP action contract
+
+The Habitat HTTP client accepts legacy `actions` responses and xNav canonical
+schema-v2 `continuous_action[16][4]` responses. For canonical chunks, the client executes only the
+`chunk_execute_horizon` prefix, reconstructs it with `canonical_relative_v1` SE(2)
+semantics, and performs Habitat discretization locally. Observations advertise
+`client_capabilities` and report the previous query's actually executed discrete
+actions in `executed_actions`. STOP, oracle-goal following, and transparent replan
+ACK behavior remain client-side compatible. The capability declaration includes
+`high_policy_replan_ack_v1`; protocol errors terminate the rollout rather than being
+counted as a normal STOP.
