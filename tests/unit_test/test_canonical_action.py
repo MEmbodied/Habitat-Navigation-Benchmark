@@ -68,7 +68,7 @@ def test_execute_horizon_limits_reconstruction_and_discrete_action_count():
     assert actions == [1]
 
 
-def test_short_nonempty_plan_does_not_stop_but_empty_plan_does():
+def test_short_and_zero_non_stop_plans_fall_back_to_forward():
     short_chunk = np.zeros((16, 4), dtype=np.float32)
     short_chunk[0, 0] = 0.2413
 
@@ -77,7 +77,7 @@ def test_short_nonempty_plan_does_not_stop_but_empty_plan_does():
     ) == [1]
     assert canonical_action.habitat_actions_from_response(
         _response(np.zeros((16, 4), dtype=np.float32), execute_horizon=1)
-    ) == [0]
+    ) == [1]
 
 
 def test_pure_positive_yaw_uses_habitat_turn_left():
@@ -109,7 +109,7 @@ def test_stop_oracle_and_legacy_actions_keep_their_execution_semantics():
 
 def test_client_capabilities_negotiate_chunk_with_legacy_fallback():
     assert canonical_action.CLIENT_CAPABILITIES == {
-        "action_transports": ["discrete", "chunk"],
+        "action_transports": ["chunk", "discrete"],
         "execution_semantics": ["canonical_relative_v1"],
         "control_protocols": ["high_policy_replan_ack_v1"],
     }

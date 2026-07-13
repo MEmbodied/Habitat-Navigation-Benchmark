@@ -17,11 +17,9 @@ CONTINUOUS_ACTION_UNIT = {"xyz": "m", "yaw": "deg"}
 REPLAN_ACK_CONTROL_PROTOCOL = "high_policy_replan_ack_v1"
 
 CLIENT_CAPABILITIES = {
-    # Keep the historical Habitat evaluation contract as the default. Chunk
-    # remains advertised for an explicitly required future migration, but must
-    # not silently replace the historical server-side discrete full-val-unseen
-    # evaluation contract.
-    "action_transports": ["discrete", "chunk"],
+    # Advertised order is preference order during server negotiation. Keep the
+    # legacy discrete transport as a rolling-upgrade fallback only.
+    "action_transports": ["chunk", "discrete"],
     "execution_semantics": [CONTINUOUS_EXECUTION_SEMANTICS],
     "control_protocols": [REPLAN_ACK_CONTROL_PROTOCOL],
 }
@@ -292,4 +290,6 @@ def habitat_actions_from_response(response: dict[str, Any]) -> list[int]:
         max_actions=max_actions,
         positive_yaw_action=2,
     )
-    return actions or [0]
+    # STOP is explicit in schema v2. A non-stop chunk that cannot be discretized
+    # must keep the rollout alive and match the legacy Habitat forward fallback.
+    return actions or [1]

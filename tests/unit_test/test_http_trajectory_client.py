@@ -114,7 +114,7 @@ def test_query_negotiates_chunk_and_reuses_feedback_during_replan(monkeypatch):
         observation = request["observation"]
         assert observation["executed_actions"] == [2, 1]
         assert observation["client_capabilities"] == {
-            "action_transports": ["discrete", "chunk"],
+            "action_transports": ["chunk", "discrete"],
             "execution_semantics": ["canonical_relative_v1"],
             "control_protocols": ["high_policy_replan_ack_v1"],
         }
@@ -202,7 +202,7 @@ def test_query_retries_same_ack_after_transport_failure(monkeypatch):
         {"instruction": "go forward"}
     )
 
-    assert result["actions"] == [0]
+    assert result["actions"] == [1]
     assert len(requests_seen) == 3
     assert requests_seen[1] == requests_seen[2]
     assert requests_seen[1]["observation"]["control_event"]["token"] == "segment-11"
