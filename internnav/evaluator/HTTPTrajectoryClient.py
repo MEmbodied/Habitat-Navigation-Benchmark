@@ -1,4 +1,4 @@
-"""HTTP bridge plus client-side execution for xNav Habitat evaluation.
+"""HTTP bridge plus client-side execution for Enactive Habitat evaluation.
 
 The client advertises its response capabilities, reconstructs canonical SE(2)
 chunks, and converts them to Habitat-native discrete actions. Legacy server

@@ -12,9 +12,9 @@ uvicorn InternNav.scripts.eval.server_Gr00t:app \
 2.接着运行：
 python scripts/eval/eval_main.py --model_path /data/sjh/GR00T-Internva/output_uav/checkpoint-300000 --continuous_traj --output_path result/Gr00t/val_unseen_32traj_8steps --save_video
 
-## xNav HTTP action contract
+## Enactive HTTP action contract
 
-The Habitat HTTP client accepts legacy `actions` responses and xNav canonical
+The Habitat HTTP client accepts legacy `actions` responses and Enactive canonical
 schema-v2 `continuous_action[16][4]` responses. For canonical chunks, the client executes only the
 `chunk_execute_horizon` prefix, reconstructs it with `canonical_relative_v1` SE(2)
 semantics, and performs Habitat discretization locally. Observations advertise

@@ -918,7 +918,7 @@ class Evaluator:
         if len(map_shape) != 2:
             return frame
 
-        rgb_width = int(metrics.get("_xnav_rgb_width", 640))
+        rgb_width = int(metrics.get("_enactive_rgb_width", 640))
         if frame.shape[1] > 640:
             rgb_width = 640
 

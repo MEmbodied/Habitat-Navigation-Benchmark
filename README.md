@@ -46,7 +46,7 @@ r2r:python scripts/eval/eval_main.py --habitat_config_path scripts/eval/configs/
 
 rxr:python scripts/eval/eval_main.py --habitat_config_path scripts/eval/configs/our_benchmark_config_sub_rxr.yaml --gr00t_port 9000 --output_path /data/sjh/InternNav/output --save_video --num_history 12
 
-## xNav HTTP action contract
+## Enactive HTTP action contract
 
 `internnav/evaluator/HTTPTrajectoryClient.py` supports both response forms:
 

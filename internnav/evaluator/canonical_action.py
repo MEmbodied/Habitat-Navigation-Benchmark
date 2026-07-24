@@ -1,4 +1,4 @@
-"""Client-side execution helpers for xNav canonical relative action chunks."""
+"""Client-side execution helpers for Enactive canonical relative action chunks."""
 
 from __future__ import annotations
 

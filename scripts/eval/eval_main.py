@@ -144,7 +144,7 @@ def main():
     # )
     traj_client = Gr00tTrajectoryClient(
         url=f"http://{args.gr00t_host}:{args.gr00t_port}/act",
-        debug_output_path=os.path.join(args.output_path, "xnav_server_snapshots"),
+        debug_output_path=os.path.join(args.output_path, "enactive_server_snapshots"),
     )
 
     # * 2. initialize evaluator
