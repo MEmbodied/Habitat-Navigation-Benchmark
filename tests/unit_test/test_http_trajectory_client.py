@@ -66,7 +66,7 @@ def _observation(**values):
     return observation
 
 
-def test_prepare_observation_converts_habitat_coordinates(monkeypatch):
+def test_prepare_observation_preserves_habitat_native_coordinates(monkeypatch):
     client_module = _load_http_client_module(monkeypatch)
     client = client_module.Gr00tTrajectoryClient("http://policy/act")
 
@@ -83,18 +83,17 @@ def test_prepare_observation_converts_habitat_coordinates(monkeypatch):
         )
     )
 
-    assert np.allclose(prepared["state_xyzyaw"], [1.25, 0.5, 0.75, 90.0])
-    assert np.allclose(
-        prepared["reference_path_gps"], [[0.0, 0.0], [2.0, -0.5]]
-    )
+    assert "state_xyzyaw" not in prepared
+    assert np.allclose(prepared["gps"], [1.25, -0.5])
+    assert np.allclose(prepared["reference_path_gps"], [[0.0, 0.0], [2.0, 0.5]])
     assert np.allclose(
         prepared["metrics"]["reference_path_gps"],
-        [[0.0, 0.0], [2.0, -0.5]],
+        [[0.0, 0.0], [2.0, 0.5]],
     )
-    assert np.allclose(prepared["metrics"]["goal_gps"], [3.0, 1.0])
+    assert np.allclose(prepared["metrics"]["goal_gps"], [3.0, -1.0])
 
 
-def test_action_response_converts_oracle_goal_to_habitat_coordinates(monkeypatch):
+def test_action_response_keeps_server_owned_habitat_oracle_goal(monkeypatch):
     client_module = _load_http_client_module(monkeypatch)
 
     response = client_module._action_response(
@@ -103,7 +102,7 @@ def test_action_response_converts_oracle_goal_to_habitat_coordinates(monkeypatch
         0,
     )
 
-    assert np.allclose(response["oracle_goal_gps"], [2.0, -1.5])
+    assert np.allclose(response["oracle_goal_gps"], [2.0, 1.5])
 
 
 def test_query_negotiates_chunk_and_reuses_feedback_during_replan(monkeypatch):
@@ -159,7 +158,7 @@ def test_query_negotiates_chunk_and_reuses_feedback_during_replan(monkeypatch):
     for request in requests:
         observation = request["observation"]
         assert observation["executed_actions"] == [2, 1]
-        assert np.allclose(observation["state_xyzyaw"], [0.0, 0.0, 0.0, 0.0])
+        assert "state_xyzyaw" not in observation
         assert observation["client_capabilities"] == {
             "action_transports": ["chunk", "discrete"],
             "execution_semantics": ["canonical_relative_v1"],

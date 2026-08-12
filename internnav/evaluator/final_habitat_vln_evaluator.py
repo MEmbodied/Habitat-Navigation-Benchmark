@@ -39,8 +39,6 @@ from abc import ABC, abstractmethod
 from enum import Enum
 from dataclasses import dataclass
 
-from enactive.eval.online.habitat_results import read_result_rows, write_habitat_summary
-
 from internnav.model.utils.vln_utils import (
     chunk_token,
     image_resize,
@@ -51,6 +49,8 @@ from internnav.model.utils.vln_utils import (
     traj_to_actions_Gr00t,
 )
 DEFAULT_IMAGE_TOKEN = "<image>"
+
+DEFAULT_CLOSED_LOOP_THRESHOLDS_M = (1.0, 3.0)
 
 
 # Habitat's base RGB sensor always reports the UUID "rgb". Distinct UUIDs are
@@ -65,6 +65,64 @@ def _safe_float(value: Any, default: float = float("nan")) -> float:
 def _finite_or_none(value: Any) -> Optional[float]:
     val = _safe_float(value)
     return val if np.isfinite(val) else None
+
+
+def _success_weighted_path_length(success: float, shortest_path_length: float, path_length: float) -> float:
+    if success <= 0.0:
+        return 0.0
+    if shortest_path_length <= 0.0 or not np.isfinite(shortest_path_length):
+        return 0.0
+    denom = max(float(path_length), float(shortest_path_length))
+    if denom <= 0.0 or not np.isfinite(denom):
+        return 0.0
+    return float(success) * float(shortest_path_length) / denom
+
+
+def _metrics_at_threshold(rows: list[dict[str, Any]], threshold_m: float) -> dict[str, float]:
+    if not rows:
+        return {
+            "sr": 0.0,
+            "spl": 0.0,
+            "os": 0.0,
+            "ne": 0.0,
+            "count": 0,
+            "threshold_m": float(threshold_m),
+        }
+
+    sr_vals: list[float] = []
+    spl_vals: list[float] = []
+    os_vals: list[float] = []
+    ne_vals: list[float] = []
+    for row in rows:
+        final_distance = _safe_float(row.get("ne"), float("inf"))
+        min_distance = _safe_float(row.get("min_distance"), final_distance)
+        path_length = _safe_float(row.get("path_length"), float("nan"))
+        shortest_path_length = _safe_float(row.get("shortest_path_length"), float("nan"))
+        stopped = bool(row.get("stopped", float(row.get("success", 0.0)) > 0.0))
+        row_success_distance = _safe_float(row.get("success_distance"), float("nan"))
+
+        if np.isfinite(row_success_distance) and abs(row_success_distance - threshold_m) < 1e-6:
+            success = _safe_float(row.get("success"), 0.0)
+            oracle_success = _safe_float(row.get("os"), 0.0)
+            spl = _safe_float(row.get("spl"), 0.0)
+        else:
+            success = float(stopped and final_distance <= threshold_m)
+            oracle_success = float(min_distance < threshold_m)
+            spl = _success_weighted_path_length(success, shortest_path_length, path_length)
+
+        sr_vals.append(success)
+        spl_vals.append(spl)
+        os_vals.append(oracle_success)
+        ne_vals.append(final_distance)
+
+    return {
+        "sr": float(sum(sr_vals) / len(sr_vals)),
+        "spl": float(sum(spl_vals) / len(spl_vals)),
+        "os": float(sum(os_vals) / len(os_vals)),
+        "ne": float(sum(ne_vals) / len(ne_vals)),
+        "count": len(rows),
+        "threshold_m": float(threshold_m),
+    }
 
 
 def build_traj_request(obs, instruction: str, rel_height: float):
@@ -1154,15 +1212,48 @@ class Evaluator:
 
     def _summarize_results(self):
         result_path = os.path.join(self.output_path, "result.json")
+        rows = []
+        if os.path.exists(result_path):
+            with open(result_path, encoding="utf-8") as f:
+                rows = [json.loads(line) for line in f if line.strip()]
+
+        def _mean(key: str) -> float:
+            return float(sum(_safe_float(row.get(key), 0.0) for row in rows) / len(rows)) if rows else 0.0
+
         native_threshold = float(self.config.habitat.task.measurements.success.success_distance)
-        rows = read_result_rows([result_path])
-        write_habitat_summary(
-            rows,
-            self.output_path,
-            native_success_distance_m=native_threshold,
-        )
+        threshold_metrics = {
+            f"{threshold:g}m": _metrics_at_threshold(rows, threshold)
+            for threshold in DEFAULT_CLOSED_LOOP_THRESHOLDS_M
+        }
+        summary = {
+            "sucs_all": _mean("success"),
+            "spls_all": _mean("spl"),
+            "oss_all": _mean("os"),
+            "nes_all": _mean("ne"),
+            "length": len(rows),
+            "success_distance": native_threshold,
+            "metrics_by_threshold": threshold_metrics,
+        }
+        metrics_summary = {
+            "native_success_distance_m": native_threshold,
+            "thresholds_m": list(DEFAULT_CLOSED_LOOP_THRESHOLDS_M),
+            "metrics_by_threshold": threshold_metrics,
+            "legacy": {
+                "sucs_all": summary["sucs_all"],
+                "spls_all": summary["spls_all"],
+                "oss_all": summary["oss_all"],
+                "nes_all": summary["nes_all"],
+                "length": summary["length"],
+                "success_distance": native_threshold,
+            },
+        }
+
         print("===== EVAL SUMMARY =====")
-        print({"length": len(rows), "success_distance": native_threshold})
+        print(summary)
+        with open(os.path.join(self.output_path, "summary.json"), "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2)
+        with open(os.path.join(self.output_path, "metrics_summary.json"), "w", encoding="utf-8") as f:
+            json.dump(metrics_summary, f, indent=2)
 
 class LLMAgent(BaseAgent):
     def __init__(
