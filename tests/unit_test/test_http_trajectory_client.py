@@ -55,6 +55,57 @@ class _Response:
         return None
 
 
+def _observation(**values):
+    observation = {
+        "instruction": "go forward",
+        "gps": [0.0, 0.0],
+        "yaw": 0.0,
+        "camera_height": 0.0,
+    }
+    observation.update(values)
+    return observation
+
+
+def test_prepare_observation_converts_habitat_coordinates(monkeypatch):
+    client_module = _load_http_client_module(monkeypatch)
+    client = client_module.Gr00tTrajectoryClient("http://policy/act")
+
+    prepared = client._prepare_observation_payload(
+        _observation(
+            gps=np.array([1.25, -0.5], dtype=np.float32),
+            yaw=np.float32(np.deg2rad(90.0)),
+            camera_height=np.float32(0.75),
+            reference_path_gps=[[0.0, 0.0], [2.0, 0.5]],
+            metrics={
+                "reference_path_gps": [[0.0, 0.0], [2.0, 0.5]],
+                "goal_gps": [3.0, -1.0],
+            },
+        )
+    )
+
+    assert np.allclose(prepared["state_xyzyaw"], [1.25, 0.5, 0.75, 90.0])
+    assert np.allclose(
+        prepared["reference_path_gps"], [[0.0, 0.0], [2.0, -0.5]]
+    )
+    assert np.allclose(
+        prepared["metrics"]["reference_path_gps"],
+        [[0.0, 0.0], [2.0, -0.5]],
+    )
+    assert np.allclose(prepared["metrics"]["goal_gps"], [3.0, 1.0])
+
+
+def test_action_response_converts_oracle_goal_to_habitat_coordinates(monkeypatch):
+    client_module = _load_http_client_module(monkeypatch)
+
+    response = client_module._action_response(
+        {"oracle_goal_gps": [2.0, 1.5]},
+        [],
+        0,
+    )
+
+    assert np.allclose(response["oracle_goal_gps"], [2.0, -1.5])
+
+
 def test_query_negotiates_chunk_and_reuses_feedback_during_replan(monkeypatch):
     client_module = _load_http_client_module(monkeypatch)
     chunk = np.zeros((16, 4), dtype=np.float32)
@@ -97,12 +148,7 @@ def test_query_negotiates_chunk_and_reuses_feedback_during_replan(monkeypatch):
     monkeypatch.setattr(client_module.requests, "post", fake_post)
     client = client_module.Gr00tTrajectoryClient("http://policy/act")
 
-    result = client.query(
-        {
-            "instruction": "go forward",
-            "executed_actions": [2, 1],
-        }
-    )
+    result = client.query(_observation(executed_actions=[2, 1]))
 
     assert result["actions"] == [1]
     assert result["replan_rounds"] == 1
@@ -113,6 +159,7 @@ def test_query_negotiates_chunk_and_reuses_feedback_during_replan(monkeypatch):
     for request in requests:
         observation = request["observation"]
         assert observation["executed_actions"] == [2, 1]
+        assert np.allclose(observation["state_xyzyaw"], [0.0, 0.0, 0.0, 0.0])
         assert observation["client_capabilities"] == {
             "action_transports": ["chunk", "discrete"],
             "execution_semantics": ["canonical_relative_v1"],
@@ -135,7 +182,7 @@ def test_query_rejects_legacy_http_200_error_response(monkeypatch):
     client = client_module.Gr00tTrajectoryClient("http://policy/act")
 
     with pytest.raises(RuntimeError, match="invalid observation"):
-        client.query({"instruction": "go forward"})
+        client.query(_observation())
 
 
 def test_replan_control_requires_non_empty_token(monkeypatch):
@@ -199,7 +246,7 @@ def test_query_retries_same_ack_after_transport_failure(monkeypatch):
 
     monkeypatch.setattr(client_module.requests, "post", fake_post)
     result = client_module.Gr00tTrajectoryClient("http://policy/act").query(
-        {"instruction": "go forward"}
+        _observation()
     )
 
     assert result["actions"] == [1]

@@ -46,10 +46,6 @@ habitat:
         success_distance: 3.0
       spl:
         type: SPL
-      # oracle_success:
-      #   type: OracleSuccess
-      # oracle_navigation_error:
-      #   type: OracleNavigationError
     actions:
       stop:
         type: StopAction
@@ -74,4 +70,4 @@ habitat:
     type: R2RVLN-v1
     split: val_seen
     scenes_dir: ../../datasets/habitat
-    data_path: ../../datasets/habitat/r2r/{split}.json.gz
+    data_path: ../../datasets/habitat/rxr/{split}_guide.json.gz

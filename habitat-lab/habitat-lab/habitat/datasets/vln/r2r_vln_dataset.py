@@ -55,9 +55,13 @@ class VLNDatasetV1(Dataset):
         self, json_str: str, scenes_dir: Optional[str] = None
     ) -> None:
         deserialized = json.loads(json_str)
-        self.instruction_vocab = VocabDict(
-            word_list=deserialized["instruction_vocab"]["word_list"]
+        instruction_vocab = deserialized.get("instruction_vocab")
+        word_list = (
+            []
+            if instruction_vocab is None
+            else instruction_vocab["word_list"]
         )
+        self.instruction_vocab = VocabDict(word_list=word_list)
 
         for episode in deserialized["episodes"]:
             episode = VLNEpisode(**episode)
@@ -70,7 +74,11 @@ class VLNDatasetV1(Dataset):
 
                 episode.scene_id = os.path.join(scenes_dir, episode.scene_id)
 
-            episode.instruction = InstructionData(**episode.instruction)
+            raw_instruction = episode.instruction
+            episode.instruction = InstructionData(
+                instruction_text=raw_instruction["instruction_text"],
+                instruction_tokens=raw_instruction.get("instruction_tokens"),
+            )
             for g_index, goal in enumerate(episode.goals):
                 episode.goals[g_index] = NavigationGoal(**goal)
             self.episodes.append(episode)

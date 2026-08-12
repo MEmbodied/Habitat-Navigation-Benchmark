@@ -30,23 +30,17 @@
     如果有新的要声明的参数在InternNav/internnav/evaluator/final_habitat_vln_evaluator.py声明
 '''
 import argparse
-import json
 import os
 import numpy as np
-import torch
-from dataclasses import dataclass
 
-from internnav.utils.dist import *
 from internnav.evaluator.final_habitat_vln_evaluator import Evaluator
 from internnav.evaluator.final_habitat_vln_evaluator import LLMAgent
 from internnav.evaluator.HTTPTrajectoryClient import Gr00tTrajectoryClient
-from internnav.evaluator.InternVATrajectoryClient import InternVATrajectoryClient
 
 def parse_args():
 
     parser = argparse.ArgumentParser(description='Evaluate InternVLA-N1 on Habitat')
     parser.add_argument("--mode", default='dual_system', type=str, help="inference mode: dual_system or system2")
-    parser.add_argument("--local_rank", default=0, type=int, help="node rank")
     parser.add_argument("--model_path", type=str, default="")
     # 如果后面habitat这边的数据集和路径什么的要变化，改下面这个文件
     parser.add_argument("--habitat_config_path", type=str, default='scripts/eval/configs/vln_r2r_no_oracle.yaml')
@@ -111,14 +105,16 @@ def parse_args():
         default=0,
         help="Random seed used by --random_eval_episodes.",
     )
+    parser.add_argument("--shard_rank", type=int, default=0)
+    parser.add_argument("--num_shards", type=int, default=1)
+    parser.add_argument(
+        "--exclude_episode_ids_file",
+        type=str,
+        default="",
+        help="JSON file of completed scene_id/episode_id pairs to exclude before sharding.",
+    )
 
-    parser.add_argument('--world_size', default=1, type=int, help='number of distributed processes')
-    parser.add_argument('--rank', default=0, type=int, help='rank')
-    parser.add_argument('--gpu', default=0, type=int, help='gpu')
     parser.add_argument('--sim_gpu', default=int(os.getenv("HABITAT_SIM_GPU", "5")), type=int, help='Habitat-Sim renderer GPU id')
-    parser.add_argument('--port', default='2333')
-    parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
-    parser.add_argument('--device', default='cuda', help='device to use for training / testing')
 
     ###连接server_Gr00t，后续使用只需要换成正确的url即可，见main()的 ===== 1. Trajectory Client =====
     parser.add_argument('--gr00t_host', default='127.0.0.1')
@@ -130,9 +126,9 @@ def main():
     args = parse_args()
     print("[[[[args.mode]]]]", args.mode)
 
-    init_distributed_mode(args)
-    local_rank = args.local_rank
-    np.random.seed(local_rank)
+    if args.num_shards <= 0 or not 0 <= args.shard_rank < args.num_shards:
+        raise ValueError("Expected 0 <= shard_rank < num_shards")
+    np.random.seed(args.shard_rank)
 
     # ===== 1. Trajectory Client =====
     print(f"Connecting to Trajectory Server at http://{args.gr00t_host}:{args.gr00t_port}/act ...")
@@ -164,8 +160,8 @@ def main():
         args=args,
         agent=agent,
         max_steps=args.max_steps,
-        idx=get_rank(),
-        env_num=get_world_size(),
+        idx=args.shard_rank,
+        env_num=args.num_shards,
     )
 
     # ===== 3. 运行评测 =====  这部分一般不用改，除非有什么最后要加的除推理之外的逻辑，计算部分已经放在了Evaluator()
