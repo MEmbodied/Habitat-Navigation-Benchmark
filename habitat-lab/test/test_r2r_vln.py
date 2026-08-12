@@ -3,6 +3,7 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+import json
 import time
 
 import pytest
@@ -18,6 +19,46 @@ from habitat.tasks.vln.vln import VLNEpisode
 CFG_TEST = "test/config/habitat/habitat_r2r_vln_test.yaml"
 R2R_VAL_SEEN_EPISODES = 778
 EPISODES_LIMIT = 1
+
+
+def test_vln_dataset_accepts_rxr_instruction_schema():
+    dataset = r2r_vln_dataset.VLNDatasetV1()
+    dataset.from_json(
+        json.dumps(
+            {
+                "episodes": [
+                    {
+                        "episode_id": "rxr-guide-1",
+                        "trajectory_id": 7,
+                        "scene_id": "mp3d/example/example.glb",
+                        "start_position": [0.0, 0.0, 0.0],
+                        "start_rotation": [0.0, 0.0, 0.0, 1.0],
+                        "goals": [{"position": [1.0, 0.0, 0.0]}],
+                        "instruction": {
+                            "instruction_id": "instruction-1",
+                            "instruction_text": "Walk to the doorway.",
+                            "language": "en-US",
+                            "annotator_id": "annotator-1",
+                            "edit_distance": 0.0,
+                            "timed_instruction": [],
+                        },
+                        "reference_path": [
+                            [0.0, 0.0, 0.0],
+                            [1.0, 0.0, 0.0],
+                        ],
+                    }
+                ]
+            }
+        ),
+        scenes_dir="scene_root",
+    )
+
+    assert dataset.instruction_vocab.word_list == ["<unk>"]
+    assert len(dataset.episodes) == 1
+    episode = dataset.episodes[0]
+    assert episode.scene_id == "scene_root/mp3d/example/example.glb"
+    assert episode.instruction.instruction_text == "Walk to the doorway."
+    assert episode.instruction.instruction_tokens is None
 
 
 def check_json_serialization(dataset: habitat.Dataset):

@@ -39,6 +39,8 @@ from abc import ABC, abstractmethod
 from enum import Enum
 from dataclasses import dataclass
 
+from enactive.eval.online.habitat_results import read_result_rows, write_habitat_summary
+
 from internnav.model.utils.vln_utils import (
     chunk_token,
     image_resize,
@@ -48,12 +50,7 @@ from internnav.model.utils.vln_utils import (
     traj_to_actions,
     traj_to_actions_Gr00t,
 )
-from internnav.utils.dist import *  # noqa: F403
-
-
 DEFAULT_IMAGE_TOKEN = "<image>"
-
-DEFAULT_CLOSED_LOOP_THRESHOLDS_M = (1.0, 3.0)
 
 
 # Habitat's base RGB sensor always reports the UUID "rgb". Distinct UUIDs are
@@ -69,63 +66,6 @@ def _finite_or_none(value: Any) -> Optional[float]:
     val = _safe_float(value)
     return val if np.isfinite(val) else None
 
-
-def _success_weighted_path_length(success: float, shortest_path_length: float, path_length: float) -> float:
-    if success <= 0.0:
-        return 0.0
-    if shortest_path_length <= 0.0 or not np.isfinite(shortest_path_length):
-        return 0.0
-    denom = max(float(path_length), float(shortest_path_length))
-    if denom <= 0.0 or not np.isfinite(denom):
-        return 0.0
-    return float(success) * float(shortest_path_length) / denom
-
-
-def _metrics_at_threshold(rows: list[dict[str, Any]], threshold_m: float) -> dict[str, float]:
-    if not rows:
-        return {
-            "sr": 0.0,
-            "spl": 0.0,
-            "os": 0.0,
-            "ne": 0.0,
-            "count": 0,
-            "threshold_m": float(threshold_m),
-        }
-
-    sr_vals: list[float] = []
-    spl_vals: list[float] = []
-    os_vals: list[float] = []
-    ne_vals: list[float] = []
-    for row in rows:
-        final_distance = _safe_float(row.get("ne"), float("inf"))
-        min_distance = _safe_float(row.get("min_distance"), final_distance)
-        path_length = _safe_float(row.get("path_length"), float("nan"))
-        shortest_path_length = _safe_float(row.get("shortest_path_length"), float("nan"))
-        stopped = bool(row.get("stopped", float(row.get("success", 0.0)) > 0.0))
-        row_success_distance = _safe_float(row.get("success_distance"), float("nan"))
-
-        if np.isfinite(row_success_distance) and abs(row_success_distance - threshold_m) < 1e-6:
-            success = _safe_float(row.get("success"), 0.0)
-            oracle_success = _safe_float(row.get("os"), 0.0)
-            spl = _safe_float(row.get("spl"), 0.0)
-        else:
-            success = float(stopped and final_distance <= threshold_m)
-            oracle_success = float(min_distance < threshold_m)
-            spl = _success_weighted_path_length(success, shortest_path_length, path_length)
-
-        sr_vals.append(success)
-        spl_vals.append(spl)
-        os_vals.append(oracle_success)
-        ne_vals.append(final_distance)
-
-    return {
-        "sr": float(sum(sr_vals) / len(sr_vals)),
-        "spl": float(sum(spl_vals) / len(spl_vals)),
-        "os": float(sum(os_vals) / len(os_vals)),
-        "ne": float(sum(ne_vals) / len(ne_vals)),
-        "count": len(rows),
-        "threshold_m": float(threshold_m),
-    }
 
 def build_traj_request(obs, instruction: str, rel_height: float):
     return {
@@ -537,8 +477,7 @@ class Evaluator:
 
     def iter_episodes(self):
         """
-        Iterate over all episodes, grouped by scene.
-        Skip episodes that already exist in result.json.
+        Select episodes, exclude completed trajectories, then shard globally.
 
         Yields:
             episode: habitat episode
@@ -564,18 +503,20 @@ class Evaluator:
             with open(result_path, "r") as f:
                 for line in f:
                     res = json.loads(line)
-                    done_res.add((
-                        res["scene_id"],
-                        str(res["episode_id"]),
-                        res["episode_instruction"],
-                    ))
+                    done_res.add((res["scene_id"], str(res["episode_id"])))
+
+        exclude_path = str(getattr(self.args, "exclude_episode_ids_file", "") or "")
+        if exclude_path:
+            with open(exclude_path, "r", encoding="utf-8") as f:
+                for item in json.load(f):
+                    done_res.add((str(item["scene_id"]), str(item["episode_id"])))
 
         candidates = []
         for scene in sorted(scene_episode_dict.keys()):
             episodes = scene_episode_dict[scene]
             scene_id = scene.split("/")[-2]
 
-            for episode in episodes[self.idx :: self.env_num]:
+            for episode in episodes:
                 if eval_episode_ids and str(episode.episode_id) not in eval_episode_ids:
                     continue
 
@@ -585,11 +526,7 @@ class Evaluator:
                     else episode.object_category
                 )
 
-                episode_key = (
-                    scene_id,
-                    str(episode.episode_id),
-                    episode_instruction,
-                )
+                episode_key = (scene_id, str(episode.episode_id))
 
                 if episode_key in done_res:
                     continue
@@ -601,6 +538,27 @@ class Evaluator:
 
             rng = random.Random(int(getattr(self.args, "eval_seed", 0) or 0))
             rng.shuffle(candidates)
+
+        candidates = candidates[self.idx :: self.env_num]
+        max_eval_episodes = int(getattr(self.args, "max_eval_episodes", 0) or 0)
+        if max_eval_episodes > 0:
+            candidates = candidates[:max_eval_episodes]
+
+        os.makedirs(self.output_path, exist_ok=True)
+        with open(os.path.join(self.output_path, "episode_plan.json"), "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "shard_rank": self.idx,
+                    "num_shards": self.env_num,
+                    "episode_count": len(candidates),
+                    "episodes": [
+                        {"scene_id": scene_id, "episode_id": str(episode.episode_id)}
+                        for episode, scene_id, _ in candidates
+                    ],
+                },
+                f,
+                indent=2,
+            )
 
         for candidate in candidates:
             yield candidate
@@ -1170,13 +1128,8 @@ class Evaluator:
     def run(self):
         current_scene = None
         process_bar = None
-        max_eval_episodes = int(getattr(self.args, "max_eval_episodes", 0) or 0)
-        num_eval_episodes = 0
 
         for episode, scene_id, episode_instruction in self.iter_episodes():
-            if max_eval_episodes > 0 and num_eval_episodes >= max_eval_episodes:
-                break
-
             # === new scene ===
             if scene_id != current_scene:
                 if process_bar is not None:
@@ -1190,7 +1143,6 @@ class Evaluator:
 
             # === run one episode ===
             self.run_episode(episode)
-            num_eval_episodes += 1
 
             # === update bar ===
             process_bar.update(1)
@@ -1198,65 +1150,19 @@ class Evaluator:
         if process_bar is not None:
             process_bar.close()
 
-        if dist.is_initialized():
-            dist.barrier()
-
-        # 只让 rank 0 负责 summary
-        if not dist.is_initialized() or dist.get_rank() == 0:
-            self._summarize_results()
+        self._summarize_results()
 
     def _summarize_results(self):
-        import json, os
-
-        rows = []
-        sucs, spls, oss, nes = [], [], [], []
-
         result_path = os.path.join(self.output_path, "result.json")
-
-        with open(result_path) as f:
-            for line in f:
-                r = json.loads(line)
-                rows.append(r)
-                sucs.append(r["success"])
-                spls.append(r["spl"])
-                oss.append(r["os"])
-                nes.append(r["ne"])
-
-        threshold_metrics = {
-            f"{threshold:g}m": _metrics_at_threshold(rows, threshold)
-            for threshold in DEFAULT_CLOSED_LOOP_THRESHOLDS_M
-        }
         native_threshold = float(self.config.habitat.task.measurements.success.success_distance)
-        summary = {
-            "sucs_all": sum(sucs) / len(sucs),
-            "spls_all": sum(spls) / len(spls),
-            "oss_all": sum(oss) / len(oss),
-            "nes_all": sum(nes) / len(nes),
-            "length": len(sucs),
-            "success_distance": native_threshold,
-            "metrics_by_threshold": threshold_metrics,
-        }
-        metrics_summary = {
-            "native_success_distance_m": native_threshold,
-            "thresholds_m": list(DEFAULT_CLOSED_LOOP_THRESHOLDS_M),
-            "metrics_by_threshold": threshold_metrics,
-            "legacy": {
-                "sucs_all": summary["sucs_all"],
-                "spls_all": summary["spls_all"],
-                "oss_all": summary["oss_all"],
-                "nes_all": summary["nes_all"],
-                "length": summary["length"],
-                "success_distance": native_threshold,
-            },
-        }
-
+        rows = read_result_rows([result_path])
+        write_habitat_summary(
+            rows,
+            self.output_path,
+            native_success_distance_m=native_threshold,
+        )
         print("===== EVAL SUMMARY =====")
-        print(summary)
-
-        with open(os.path.join(self.output_path, "summary.json"), "w") as f:
-            json.dump(summary, f, indent=2)
-        with open(os.path.join(self.output_path, "metrics_summary.json"), "w") as f:
-            json.dump(metrics_summary, f, indent=2)
+        print({"length": len(rows), "success_distance": native_threshold})
 
 class LLMAgent(BaseAgent):
     def __init__(
