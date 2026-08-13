@@ -62,14 +62,10 @@ def _safe_float(value: Any, default: float = float("nan")) -> float:
         return default
 
 
-def _finite_or_none(value: Any) -> Optional[float]:
-    val = _safe_float(value)
-    return val if np.isfinite(val) else None
-
-
 def build_traj_request(obs, instruction: str, rel_height: float):
     return {
         "rgb": obs.rgb,
+        "rgb_views": obs.rgb_views,
         "depth": obs.depth,
         "gps": obs.gps,
         "yaw": obs.compass,
@@ -302,6 +298,7 @@ class Observation:
     compass: float
     step_id: int
     height: float
+    rgb_views: dict[str, np.ndarray]
     episode_id: str = ""
     scene_id: str = ""
     metrics: Optional[dict] = None
@@ -418,6 +415,23 @@ class Evaluator:
             success_distance = getattr(args, "success_distance", None)
             if success_distance is not None:
                 self.config.habitat.task.measurements.success.success_distance = float(success_distance)
+            agent_config = self.config.habitat.simulator.agents.main_agent
+            front_sensor = agent_config.sim_sensors["rgb_sensor"]
+            front_orientation = list(front_sensor.orientation)
+            for view_name, yaw_offset in (
+                ("left", -np.pi / 2.0),
+                ("right", np.pi / 2.0),
+                ("rear", np.pi),
+            ):
+                sensor = copy.deepcopy(front_sensor)
+                OmegaConf.set_struct(sensor, False)
+                sensor.uuid = f"rgb_{view_name}"
+                sensor.orientation = [
+                    float(front_orientation[0]),
+                    float(front_orientation[1]) + yaw_offset,
+                    float(front_orientation[2]),
+                ]
+                agent_config.sim_sensors[f"rgb_{view_name}_sensor"] = sensor
             self.config.habitat.task.measurements.update(
                 {
                     "top_down_map": TopDownMapMeasurementConfig(
@@ -582,6 +596,7 @@ class Evaluator:
         observations = self.env.reset()
         print(f"[EvalInitEpisode] after reset episode={getattr(episode, 'episode_id', '')}", flush=True)
         observations = self._repair_observation_render(observations, "reset")
+        shortest_path_length = float(self.env.get_metrics()["distance_to_goal"])
 
         # === 初始高度（给 agent 用）===
         initial_height = self.env.sim.get_agent_state().position[1]
@@ -601,36 +616,11 @@ class Evaluator:
         self.initial_height = initial_height
         self._prev_video_map_coord = None
 
-        return observations, initial_height
-
-    @staticmethod
-    def _episode_shortest_path_length(episode) -> Optional[float]:
-        candidates = []
-        info = getattr(episode, "info", None)
-        if isinstance(info, dict):
-            candidates.extend(
-                [
-                    info.get("geodesic_distance"),
-                    info.get("shortest_path_length"),
-                    info.get("shortest_path_distance"),
-                ]
-            )
-        candidates.extend(
-            [
-                getattr(episode, "geodesic_distance", None),
-                getattr(episode, "shortest_path_length", None),
-                getattr(episode, "shortest_path_distance", None),
-            ]
-        )
-        for candidate in candidates:
-            value = _finite_or_none(candidate)
-            if value is not None and value >= 0.0:
-                return value
-        return None
+        return observations, initial_height, shortest_path_length
 
     def run_episode(self, episode):
         # ===== Episode init =====
-        observations, initial_height = self._init_episode(episode)
+        observations, initial_height, shortest_path_length = self._init_episode(episode)
         episode_instruction = self._episode_instruction_text(episode)
         self.agent.reset(
             episode_instruction,
@@ -758,10 +748,6 @@ class Evaluator:
         stopped = bool(last_action_value == Action.STOP.value)
         if not np.isfinite(min_distance):
             min_distance = ne
-        shortest_path_length = self._episode_shortest_path_length(episode)
-        if shortest_path_length is None:
-            shortest_path_length = float("nan")
-
         self.sucs.append(success)
         self.spls.append(spl)
         self.oss.append(oracle_success)
@@ -1114,6 +1100,12 @@ class Evaluator:
 
         return Observation(
             rgb=observations["rgb"],
+            rgb_views={
+                "front": observations["rgb"],
+                "left": observations["rgb_left"],
+                "right": observations["rgb_right"],
+                "rear": observations["rgb_rear"],
+            },
             depth=observations["depth"],
             gps=observations["gps"],
             compass=observations["compass"][0],
@@ -1499,6 +1491,12 @@ class LLMAgent(BaseAgent):
             
             req_floor = {
                 "rgb": obs_down_2["rgb"],
+                "rgb_views": {
+                    "front": obs_down_2["rgb"],
+                    "left": obs_down_2["rgb_left"],
+                    "right": obs_down_2["rgb_right"],
+                    "rear": obs_down_2["rgb_rear"],
+                },
                 "depth": obs_down_2["depth"],
                 "gps": obs_down_2["gps"],
                 "yaw": obs_down_2["compass"][0],
