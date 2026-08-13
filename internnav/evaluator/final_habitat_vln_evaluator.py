@@ -128,6 +128,7 @@ def _metrics_at_threshold(rows: list[dict[str, Any]], threshold_m: float) -> dic
 def build_traj_request(obs, instruction: str, rel_height: float):
     return {
         "rgb": obs.rgb,
+        "rgb_views": obs.rgb_views,
         "depth": obs.depth,
         "gps": obs.gps,
         "yaw": obs.compass,
@@ -360,6 +361,7 @@ class Observation:
     compass: float
     step_id: int
     height: float
+    rgb_views: dict[str, np.ndarray]
     episode_id: str = ""
     scene_id: str = ""
     metrics: Optional[dict] = None
@@ -476,6 +478,23 @@ class Evaluator:
             success_distance = getattr(args, "success_distance", None)
             if success_distance is not None:
                 self.config.habitat.task.measurements.success.success_distance = float(success_distance)
+            agent_config = self.config.habitat.simulator.agents.main_agent
+            front_sensor = agent_config.sim_sensors["rgb_sensor"]
+            front_orientation = list(front_sensor.orientation)
+            for view_name, yaw_offset in (
+                ("left", -np.pi / 2.0),
+                ("right", np.pi / 2.0),
+                ("rear", np.pi),
+            ):
+                sensor = copy.deepcopy(front_sensor)
+                OmegaConf.set_struct(sensor, False)
+                sensor.uuid = f"rgb_{view_name}"
+                sensor.orientation = [
+                    float(front_orientation[0]),
+                    float(front_orientation[1]) + yaw_offset,
+                    float(front_orientation[2]),
+                ]
+                agent_config.sim_sensors[f"rgb_{view_name}_sensor"] = sensor
             self.config.habitat.task.measurements.update(
                 {
                     "top_down_map": TopDownMapMeasurementConfig(
@@ -1172,6 +1191,12 @@ class Evaluator:
 
         return Observation(
             rgb=observations["rgb"],
+            rgb_views={
+                "front": observations["rgb"],
+                "left": observations["rgb_left"],
+                "right": observations["rgb_right"],
+                "rear": observations["rgb_rear"],
+            },
             depth=observations["depth"],
             gps=observations["gps"],
             compass=observations["compass"][0],
@@ -1590,6 +1615,12 @@ class LLMAgent(BaseAgent):
             
             req_floor = {
                 "rgb": obs_down_2["rgb"],
+                "rgb_views": {
+                    "front": obs_down_2["rgb"],
+                    "left": obs_down_2["rgb_left"],
+                    "right": obs_down_2["rgb_right"],
+                    "rear": obs_down_2["rgb_rear"],
+                },
                 "depth": obs_down_2["depth"],
                 "gps": obs_down_2["gps"],
                 "yaw": obs_down_2["compass"][0],
