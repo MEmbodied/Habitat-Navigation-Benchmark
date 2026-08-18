@@ -35,6 +35,10 @@ except ImportError:
     def to_numpy_array(image):
         return np.asarray(image)
 from internnav.evaluator.ndtw import NDTW
+from internnav.evaluator.episode_plan import (
+    load_or_create_episode_plan,
+    remaining_episode_keys,
+)
 from abc import ABC, abstractmethod
 from enum import Enum
 from dataclasses import dataclass
@@ -554,7 +558,7 @@ class Evaluator:
 
     def iter_episodes(self):
         """
-        Select episodes, exclude completed trajectories, then shard globally.
+        Create one immutable shard plan, then exclude locally completed episodes.
 
         Yields:
             episode: habitat episode
@@ -567,7 +571,7 @@ class Evaluator:
             if episode.scene_id not in scene_episode_dict:
                 scene_episode_dict[episode.scene_id] = []
             scene_episode_dict[episode.scene_id].append(episode)
-        done_res = set()
+        locally_completed = set()
         result_path = os.path.join(self.output_path, "result.json")
         eval_episode_ids = getattr(self.args, "eval_episode_ids", "") or ""
         eval_episode_ids = {
@@ -580,13 +584,14 @@ class Evaluator:
             with open(result_path, "r") as f:
                 for line in f:
                     res = json.loads(line)
-                    done_res.add((res["scene_id"], str(res["episode_id"])))
+                    locally_completed.add((res["scene_id"], str(res["episode_id"])))
 
+        baseline_exclusions = set()
         exclude_path = str(getattr(self.args, "exclude_episode_ids_file", "") or "")
         if exclude_path:
             with open(exclude_path, "r", encoding="utf-8") as f:
                 for item in json.load(f):
-                    done_res.add((str(item["scene_id"]), str(item["episode_id"])))
+                    baseline_exclusions.add((str(item["scene_id"]), str(item["episode_id"])))
 
         candidates = []
         for scene in sorted(scene_episode_dict.keys()):
@@ -605,10 +610,10 @@ class Evaluator:
 
                 episode_key = (scene_id, str(episode.episode_id))
 
-                if episode_key in done_res:
+                if episode_key in baseline_exclusions:
                     continue
 
-                candidates.append((episode, scene_id, episode_instruction))
+                candidates.append((episode_key, episode, scene_id, episode_instruction))
 
         if bool(getattr(self.args, "random_eval_episodes", False)):
             import random
@@ -616,29 +621,20 @@ class Evaluator:
             rng = random.Random(int(getattr(self.args, "eval_seed", 0) or 0))
             rng.shuffle(candidates)
 
-        candidates = candidates[self.idx :: self.env_num]
         max_eval_episodes = int(getattr(self.args, "max_eval_episodes", 0) or 0)
-        if max_eval_episodes > 0:
-            candidates = candidates[:max_eval_episodes]
-
-        os.makedirs(self.output_path, exist_ok=True)
-        with open(os.path.join(self.output_path, "episode_plan.json"), "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "shard_rank": self.idx,
-                    "num_shards": self.env_num,
-                    "episode_count": len(candidates),
-                    "episodes": [
-                        {"scene_id": scene_id, "episode_id": str(episode.episode_id)}
-                        for episode, scene_id, _ in candidates
-                    ],
-                },
-                f,
-                indent=2,
-            )
-
-        for candidate in candidates:
-            yield candidate
+        candidates_by_key = {
+            key: (episode, scene_id, episode_instruction)
+            for key, episode, scene_id, episode_instruction in candidates
+        }
+        plan = load_or_create_episode_plan(
+            os.path.join(self.output_path, "episode_plan.json"),
+            list(candidates_by_key),
+            shard_rank=self.idx,
+            num_shards=self.env_num,
+            max_episodes=max_eval_episodes,
+        )
+        for episode_key in remaining_episode_keys(plan, locally_completed):
+            yield candidates_by_key[episode_key]
 
     def _episode_instruction_text(self, episode):
         manual_instruction = str(getattr(self.args, "manual_instruction", "") or "").strip()
