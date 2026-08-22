@@ -140,6 +140,7 @@ def main():
     # )
     traj_client = Gr00tTrajectoryClient(
         url=f"http://{args.gr00t_host}:{args.gr00t_port}/act",
+        env_id=f"habitat-shard-{args.shard_rank}",
         debug_output_path=os.path.join(args.output_path, "enactive_server_snapshots"),
     )
 

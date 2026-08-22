@@ -54,6 +54,9 @@ class _Response:
     def raise_for_status(self):
         return None
 
+    def json(self):
+        return json_numpy.loads(self.text)
+
 
 def _observation(**values):
     observation = {
@@ -66,9 +69,25 @@ def _observation(**values):
     return observation
 
 
+def _client(client_module):
+    client = client_module.Gr00tTrajectoryClient(
+        "http://policy/act",
+        env_id="habitat-worker-0",
+    )
+    client.reset(
+        "go forward",
+        episode_id="episode-1",
+        scene_id="data/scene-1/scene.glb",
+    )
+    return client
+
+
 def test_prepare_observation_converts_habitat_coordinates(monkeypatch):
     client_module = _load_http_client_module(monkeypatch)
-    client = client_module.Gr00tTrajectoryClient("http://policy/act")
+    client = client_module.Gr00tTrajectoryClient(
+        "http://policy/act",
+        env_id="habitat-worker-0",
+    )
 
     prepared = client._prepare_observation_payload(
         _observation(
@@ -146,7 +165,7 @@ def test_query_negotiates_chunk_and_reuses_feedback_during_replan(monkeypatch):
         return _Response(next(responses))
 
     monkeypatch.setattr(client_module.requests, "post", fake_post)
-    client = client_module.Gr00tTrajectoryClient("http://policy/act")
+    client = _client(client_module)
 
     result = client.query(_observation(executed_actions=[2, 1]))
 
@@ -156,6 +175,10 @@ def test_query_negotiates_chunk_and_reuses_feedback_during_replan(monkeypatch):
     assert result["schema_version"] == 2
     assert result["chunk_execute_horizon"] == 1
     assert len(requests) == 2
+    assert [
+        request["observation"]["request_sequence"] for request in requests
+    ] == [0, 1]
+    assert [request["observation"]["reset"] for request in requests] == [True, False]
     for request in requests:
         observation = request["observation"]
         assert observation["executed_actions"] == [2, 1]
@@ -179,7 +202,7 @@ def test_query_rejects_legacy_http_200_error_response(monkeypatch):
         return _Response({"error": "invalid observation", "stop": True})
 
     monkeypatch.setattr(client_module.requests, "post", fake_post)
-    client = client_module.Gr00tTrajectoryClient("http://policy/act")
+    client = _client(client_module)
 
     with pytest.raises(RuntimeError, match="invalid observation"):
         client.query(_observation())
@@ -245,11 +268,77 @@ def test_query_retries_same_ack_after_transport_failure(monkeypatch):
         return response
 
     monkeypatch.setattr(client_module.requests, "post", fake_post)
-    result = client_module.Gr00tTrajectoryClient("http://policy/act").query(
-        _observation()
-    )
+    result = _client(client_module).query(_observation(step_id=17))
 
     assert result["actions"] == [1]
     assert len(requests_seen) == 3
     assert requests_seen[1] == requests_seen[2]
+    assert requests_seen[0]["observation"]["step_id"] == 17
+    assert requests_seen[0]["observation"]["request_sequence"] == 0
+    assert requests_seen[1]["observation"]["step_id"] == 17
+    assert requests_seen[1]["observation"]["request_sequence"] == 1
     assert requests_seen[1]["observation"]["control_event"]["token"] == "segment-11"
+
+
+def test_episode_end_is_explicit_and_uses_stable_terminal_event(monkeypatch):
+    client_module = _load_http_client_module(monkeypatch)
+    posted = []
+
+    def fake_post(url, data, headers, timeout):
+        del headers, timeout
+        posted.append((url, json_numpy.loads(data)))
+        return _Response({"status": "success"})
+
+    monkeypatch.setattr(client_module.requests, "post", fake_post)
+    client = _client(client_module)
+    result = client.end_episode(
+        {
+            "termination_kind": "model_stop",
+            "steps": 9,
+            "success": True,
+            "client_trajectory_xyyaw_m": [[0.0, 0.0, 0.0]],
+        }
+    )
+
+    assert result == {"status": "success"}
+    assert posted[0][0] == "http://policy/episode_end"
+    payload = posted[0][1]
+    assert payload["termination_kind"] == "model_stop"
+    assert payload["steps"] == 9
+    assert payload["success"] is True
+    assert payload["event_id"].startswith("habitat-episode-end-")
+    assert client._active_identity is None
+
+
+def test_episode_end_retries_identical_payload_after_lost_response(monkeypatch):
+    client_module = _load_http_client_module(monkeypatch)
+    posted = []
+    outcomes = iter(
+        [
+            client_module.requests.ConnectionError("terminal response lost"),
+            _Response({"status": "success"}),
+        ]
+    )
+
+    def fake_post(url, data, headers, timeout):
+        del headers, timeout
+        posted.append((url, json_numpy.loads(data)))
+        outcome = next(outcomes)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(client_module.requests, "post", fake_post)
+    client = _client(client_module)
+
+    client.end_episode(
+        {
+            "termination_kind": "environment_done",
+            "steps": 4,
+            "success": False,
+        }
+    )
+
+    assert len(posted) == 2
+    assert posted[0] == posted[1]
+    assert client._active_identity is None

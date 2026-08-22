@@ -328,7 +328,7 @@ class BaseAgent(ABC):
     def set_camera_params(self, params: dict):
         pass
 
-    def on_episode_end(self, metrics: dict):
+    def on_episode_end(self, event: dict):
         pass
 
 class HabitatSensorAPI:
@@ -383,6 +383,9 @@ class BaseTrajectoryClient:
         """
         返回 Habitat action id list
         """
+        raise NotImplementedError
+
+    def end_episode(self, event: dict) -> dict:
         raise NotImplementedError
 
 class Evaluator:
@@ -621,7 +624,9 @@ class Evaluator:
         self.agent.reset(
             episode_instruction,
             init_yaw=self.initial_yaw,
-            initial_height=self.initial_height
+            initial_height=self.initial_height,
+            episode_id=str(episode.episode_id),
+            scene_id=str(episode.scene_id),
         )
 
         step = 0
@@ -633,6 +638,9 @@ class Evaluator:
         path_length = 0.0
         prev_position = np.asarray(self.env.sim.get_agent_state().position, dtype=np.float64)
         last_action_value = None
+        client_trajectory_xyyaw_m = [
+            self._model_pose_xyyaw(observations)
+        ]
 
         while not done and step < self.max_steps:
             if self.env.episode_over:
@@ -675,6 +683,9 @@ class Evaluator:
                 flush=True,
             )
             observations = self._repair_observation_render(observations, f"step{step}_action{action.value}")
+            client_trajectory_xyyaw_m.append(
+                self._model_pose_xyyaw(observations)
+            )
             current_position = np.asarray(self.env.sim.get_agent_state().position, dtype=np.float64)
             if current_position.shape == prev_position.shape:
                 delta = float(np.linalg.norm(current_position - prev_position))
@@ -729,7 +740,6 @@ class Evaluator:
 
         # ===== episode end =====
         metrics = self.env.get_metrics()
-        self.agent.on_episode_end(metrics)
         
         # ===== evaluator-level metric（和之前完全一致）=====
         success = metrics["success"]
@@ -742,6 +752,13 @@ class Evaluator:
             min_distance < self.config.habitat.task.measurements.success.success_distance
         )
         stopped = bool(last_action_value == Action.STOP.value)
+        termination_kind = (
+            "model_stop"
+            if stopped
+            else "budget_exhausted"
+            if step >= self.max_steps and not self.env.episode_over
+            else "environment_done"
+        )
         if not np.isfinite(min_distance):
             min_distance = ne
         self.sucs.append(success)
@@ -766,6 +783,7 @@ class Evaluator:
             "stopped": bool(stopped),
             "last_action": int(last_action_value) if last_action_value is not None else None,
             "steps": step,
+            "termination_kind": termination_kind,
             "episode_instruction": episode_instruction,
             "dataset_episode_instruction": (
                 episode.instruction.instruction_text
@@ -775,45 +793,60 @@ class Evaluator:
             "manual_instruction_override": bool(str(getattr(self.args, "manual_instruction", "") or "").strip()),
         }
 
-        with open(os.path.join(self.output_path, "result.json"), "a") as f:
-            f.write(json.dumps(result) + "\n")
-        self._last_result_record = result
+        terminal_event = {
+            "episode_id": str(episode.episode_id),
+            "scene_id": str(episode.scene_id),
+            "termination_kind": termination_kind,
+            "termination_reason": termination_kind,
+            "steps": int(step),
+            "success": bool(success),
+            "client_trajectory_xyyaw_m": client_trajectory_xyyaw_m,
+        }
+        try:
+            with open(os.path.join(self.output_path, "result.json"), "a") as f:
+                f.write(json.dumps(result) + "\n")
+            self._last_result_record = result
 
-        print(
-            f"[Eval] Episode {str(episode.episode_id)} finished | "
-            f"success={success}, spl={spl:.3f}, ne={ne:.3f} | "
-            f"result.json updated"
-        )
-
-        if self.save_video and len(self.vis_frames) > 0:
-            print(f"[Eval] episode={episode.episode_id} before_images_to_video", flush=True)
-            scene_id = episode.scene_id.split("/")[-2]
-            save_dir = os.path.join(
-                self.output_path,
-                "vis",
-                scene_id,
+            print(
+                f"[Eval] Episode {str(episode.episode_id)} finished | "
+                f"success={success}, spl={spl:.3f}, ne={ne:.3f} | "
+                f"result.json updated"
             )
-            os.makedirs(save_dir, exist_ok=True)
 
-            images_to_video(
-                self.vis_frames,
-                save_dir,
-                f"{episode.episode_id}",
-                fps=6,
-                quality=9,
-            )
-            print(f"[Eval] episode={episode.episode_id} after_images_to_video", flush=True)
-            video_name = "video"
+            if self.save_video and len(self.vis_frames) > 0:
+                print(f"[Eval] episode={episode.episode_id} before_images_to_video", flush=True)
+                scene_id = episode.scene_id.split("/")[-2]
+                save_dir = os.path.join(
+                    self.output_path,
+                    "vis",
+                    scene_id,
+                )
+                os.makedirs(save_dir, exist_ok=True)
 
-            # print(
-            #     f"[Eval] 🎬 Video saved: "
-            #     f"{os.path.join(save_dir, video_name)}.mp4"
-            # )
-
-        self.vis_frames.clear()
-        self._prev_video_map_coord = None
+                images_to_video(
+                    self.vis_frames,
+                    save_dir,
+                    f"{episode.episode_id}",
+                    fps=6,
+                    quality=9,
+                )
+                print(f"[Eval] episode={episode.episode_id} after_images_to_video", flush=True)
+        finally:
+            try:
+                self.agent.on_episode_end(terminal_event)
+            finally:
+                self.vis_frames.clear()
+                self._prev_video_map_coord = None
 
         return metrics
+
+    @staticmethod
+    def _model_pose_xyyaw(observations) -> list[float]:
+        gps = np.asarray(observations["gps"], dtype=np.float64).reshape(-1)
+        compass = float(
+            np.asarray(observations["compass"], dtype=np.float64).reshape(-1)[0]
+        )
+        return [float(gps[0]), -float(gps[1]), float(np.degrees(compass))]
 
     @staticmethod
     def _current_map_coord(metrics):
@@ -1236,7 +1269,11 @@ class LLMAgent(BaseAgent):
         self.instruction = instruction
         self.init_yaw = init_yaw
         self.initial_height = initial_height
-        self.traj_client.reset(instruction)
+        self.traj_client.reset(
+            instruction,
+            episode_id=kwargs.get("episode_id"),
+            scene_id=kwargs.get("scene_id"),
+        )
 
         self.conversation = [
             {"from": "human", "value": self.base_prompt.replace("<instruction>", instruction)},
@@ -1260,6 +1297,9 @@ class LLMAgent(BaseAgent):
 
     def record_executed_action(self, action: int):
         self._executed_actions_since_query.append(int(action))
+
+    def on_episode_end(self, event: dict):
+        return self.traj_client.end_episode(event)
 
     def _query_trajectory_server(self, request: dict, **kwargs):
         request_payload = dict(request)

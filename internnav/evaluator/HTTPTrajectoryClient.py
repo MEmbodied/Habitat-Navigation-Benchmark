@@ -5,8 +5,12 @@ chunks, and converts them to Habitat-native discrete actions. Legacy server
 ``actions`` responses remain supported during the migration window.
 """
 
-import requests
+import hashlib
 import os
+from typing import Optional
+import uuid
+
+import requests
 from internnav.evaluator.final_habitat_vln_evaluator import BaseTrajectoryClient
 import json_numpy
 import numpy as np
@@ -24,6 +28,7 @@ json_numpy.patch()
 
 _MAX_REPLAN_ROUNDS = 4
 _MAX_REPLAN_ACK_POST_ATTEMPTS = 3
+_MAX_EPISODE_END_POST_ATTEMPTS = 3
 
 _RESPONSE_METADATA_KEYS = (
     "action_transport",
@@ -123,13 +128,128 @@ def _action_response(result: dict, actions: list[int], replan_rounds: int) -> di
 
 #更换模型只需要添加并调用一个新的类即可，以下面这个为例
 class Gr00tTrajectoryClient(BaseTrajectoryClient):
-    def __init__(self, url, debug_output_path=None):
+    def __init__(self, url, *, env_id: str, debug_output_path=None):
         self.url = url
         self.timeout = float(os.getenv("HABITAT_CLIENT_TIMEOUT", "300"))
         self.debug_output_path = debug_output_path
+        self._base_env_id = str(env_id).strip()
+        if not self._base_env_id:
+            raise ValueError("Habitat env_id is required")
+        self._client_session_id = uuid.uuid4().hex
+        self._active_identity = None
+        self._next_request_sequence = 0
 
     def reset(self, instruction: str, **kwargs):
-        pass
+        episode_id = str(kwargs.get("episode_id") or "").strip()
+        scene_id = str(kwargs.get("scene_id") or "").strip()
+        if not episode_id or not scene_id:
+            raise ValueError("Habitat reset requires episode_id and scene_id")
+        if self._active_identity is not None:
+            raise RuntimeError(
+                "previous Habitat policy session was not ended before reset"
+            )
+        scene_digest = hashlib.sha256(scene_id.encode("utf-8")).hexdigest()[:12]
+        self._active_identity = (
+            self._client_session_id,
+            f"{self._base_env_id}:{scene_digest}",
+            episode_id,
+        )
+        self._next_request_sequence = 0
+
+    def _protocol_observation(
+        self,
+        observation: dict,
+        *,
+        control_event: Optional[dict] = None,
+    ) -> dict:
+        if self._active_identity is None:
+            raise RuntimeError("Habitat trajectory client was queried before reset")
+        assignment_id, env_id, episode_id = self._active_identity
+        sequence = self._next_request_sequence
+        request_digest = hashlib.sha256(
+            "\0".join(
+                (
+                    assignment_id,
+                    env_id,
+                    episode_id,
+                    str(sequence),
+                )
+            ).encode("utf-8")
+        ).hexdigest()
+        prepared = dict(observation)
+        prepared.update(
+            {
+                "assignment_id": assignment_id,
+                "env_id": env_id,
+                "episode_id": episode_id,
+                "request_id": f"habitat-act-{request_digest}",
+                "request_sequence": sequence,
+                "reset": sequence == 0,
+            }
+        )
+        if control_event is not None:
+            prepared["control_event"] = dict(control_event)
+        else:
+            prepared.pop("control_event", None)
+        return prepared
+
+    def end_episode(self, event: dict) -> dict:
+        if self._active_identity is None:
+            raise RuntimeError("Habitat trajectory client has no active episode")
+        assignment_id, env_id, episode_id = self._active_identity
+        event_digest = hashlib.sha256(
+            "\0".join(self._active_identity).encode("utf-8")
+        ).hexdigest()
+        payload = {
+            "assignment_id": assignment_id,
+            "env_id": env_id,
+            "episode_id": episode_id,
+            "event_id": f"habitat-episode-end-{event_digest}",
+            "termination_kind": str(
+                event.get("termination_kind") or "environment_done"
+            ),
+            "termination_reason": str(
+                event.get("termination_reason")
+                or event.get("termination_kind")
+                or "environment_done"
+            ),
+            "steps": int(event.get("steps", 0) or 0),
+            "success": bool(event.get("success", False)),
+            "client_trajectory_xyyaw_m": list(
+                event.get("client_trajectory_xyyaw_m") or []
+            ),
+        }
+        body = json_numpy.dumps(payload)
+        endpoint = self.url.rsplit("/act", 1)[0] + "/episode_end"
+        response = None
+        for attempt in range(_MAX_EPISODE_END_POST_ATTEMPTS):
+            try:
+                response = requests.post(
+                    endpoint,
+                    data=body,
+                    headers={"Content-Type": "application/json"},
+                    timeout=self.timeout,
+                )
+                response.raise_for_status()
+                break
+            except requests.RequestException as exc:
+                status_code = getattr(
+                    getattr(exc, "response", None),
+                    "status_code",
+                    None,
+                )
+                retryable = status_code is None or int(status_code) >= 500
+                if not retryable or attempt + 1 >= _MAX_EPISODE_END_POST_ATTEMPTS:
+                    raise
+        if response is None:
+            raise RuntimeError("Habitat episode_end produced no response")
+        try:
+            result = response.json()
+        except (TypeError, ValueError):
+            result = {"status": "success"}
+        self._active_identity = None
+        self._next_request_sequence = 0
+        return result if isinstance(result, dict) else {"status": "success"}
 
     def _save_client_observation(self, obs: dict):
         if not self.debug_output_path:
@@ -270,21 +390,26 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
         metrics = obs_payload.get("metrics")
         if isinstance(metrics, dict):
             obs_payload["metrics"] = self._json_safe(metrics)
-        #包一层约定协议
-        payload = {"observation": obs_payload}
         if self.debug_output_path:
-            payload["debug_output_path"] = self.debug_output_path
             self._save_client_observation(obs_payload)
         # 1. 使用 HTTP 发送；控制响应在同一 observation 上透明 ACK 后重试。
         original_obs_payload = dict(obs_payload)
         replan_rounds = 0
+        control_event = None
         while True:
-            payload["observation"] = obs_payload
+            obs_payload = self._protocol_observation(
+                original_obs_payload,
+                control_event=control_event,
+            )
+            payload = {"observation": obs_payload}
+            if self.debug_output_path:
+                payload["debug_output_path"] = self.debug_output_path
             resp = _post_act(
                 self.url,
                 payload,
                 timeout=self.timeout,
             )
+            self._next_request_sequence += 1
 
             # 2. 还原返回值
             result = json_numpy.loads(resp.text)
@@ -301,8 +426,7 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
                     "policy server exceeded the maximum of "
                     f"{_MAX_REPLAN_ROUNDS} transparent replan rounds"
                 )
-            obs_payload = dict(original_obs_payload)
-            obs_payload["control_event"] = _replan_ack(result)
+            control_event = _replan_ack(result)
             replan_rounds += 1
             
         if (
