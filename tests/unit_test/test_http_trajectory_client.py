@@ -6,7 +6,9 @@ import types
 import json_numpy
 import numpy as np
 import pytest
-import requests
+import requests as http_requests
+
+from enactive.client import deploy as deploy_client
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -164,7 +166,7 @@ def test_query_negotiates_chunk_and_reuses_feedback_during_replan(monkeypatch):
         assert timeout == 300.0
         return _Response(next(responses))
 
-    monkeypatch.setattr(client_module.requests, "post", fake_post)
+    monkeypatch.setattr(deploy_client.requests, "post", fake_post)
     client = _client(client_module)
 
     result = client.query(_observation(executed_actions=[2, 1]))
@@ -201,7 +203,7 @@ def test_query_rejects_legacy_http_200_error_response(monkeypatch):
         del args, kwargs
         return _Response({"error": "invalid observation", "stop": True})
 
-    monkeypatch.setattr(client_module.requests, "post", fake_post)
+    monkeypatch.setattr(deploy_client.requests, "post", fake_post)
     client = _client(client_module)
 
     with pytest.raises(RuntimeError, match="invalid observation"):
@@ -209,10 +211,10 @@ def test_query_rejects_legacy_http_200_error_response(monkeypatch):
 
 
 def test_replan_control_requires_non_empty_token(monkeypatch):
-    client_module = _load_http_client_module(monkeypatch)
+    _load_http_client_module(monkeypatch)
 
     with pytest.raises(ValueError, match="non-empty token"):
-        client_module._replan_ack(
+        deploy_client._replan_ack(
             {
                 "replan_required": True,
                 "control_event": {
@@ -240,7 +242,7 @@ def test_query_retries_same_ack_after_transport_failure(monkeypatch):
                     },
                 }
             ),
-            requests.ConnectionError("response lost"),
+            http_requests.ConnectionError("response lost"),
             _Response(
                 {
                     "schema_version": 2,
@@ -267,7 +269,7 @@ def test_query_retries_same_ack_after_transport_failure(monkeypatch):
             raise response
         return response
 
-    monkeypatch.setattr(client_module.requests, "post", fake_post)
+    monkeypatch.setattr(deploy_client.requests, "post", fake_post)
     result = _client(client_module).query(_observation(step_id=17))
 
     assert result["actions"] == [1]
@@ -289,7 +291,7 @@ def test_episode_end_is_explicit_and_uses_stable_terminal_event(monkeypatch):
         posted.append((url, json_numpy.loads(data)))
         return _Response({"status": "success"})
 
-    monkeypatch.setattr(client_module.requests, "post", fake_post)
+    monkeypatch.setattr(deploy_client.requests, "post", fake_post)
     client = _client(client_module)
     result = client.end_episode(
         {
@@ -306,7 +308,7 @@ def test_episode_end_is_explicit_and_uses_stable_terminal_event(monkeypatch):
     assert payload["termination_kind"] == "model_stop"
     assert payload["steps"] == 9
     assert payload["success"] is True
-    assert payload["event_id"].startswith("habitat-episode-end-")
+    assert payload["event_id"].startswith("deploy-episode-end-")
     assert client._active_identity is None
 
 
@@ -315,7 +317,7 @@ def test_episode_end_retries_identical_payload_after_lost_response(monkeypatch):
     posted = []
     outcomes = iter(
         [
-            client_module.requests.ConnectionError("terminal response lost"),
+            http_requests.ConnectionError("terminal response lost"),
             _Response({"status": "success"}),
         ]
     )
@@ -328,7 +330,7 @@ def test_episode_end_retries_identical_payload_after_lost_response(monkeypatch):
             raise outcome
         return outcome
 
-    monkeypatch.setattr(client_module.requests, "post", fake_post)
+    monkeypatch.setattr(deploy_client.requests, "post", fake_post)
     client = _client(client_module)
 
     client.end_episode(
@@ -341,4 +343,210 @@ def test_episode_end_retries_identical_payload_after_lost_response(monkeypatch):
 
     assert len(posted) == 2
     assert posted[0] == posted[1]
+    assert client._active_identity is None
+
+
+@pytest.mark.parametrize(
+    ("condition", "expects_action"),
+    [("robot_demo", True), ("video_demo", False)],
+)
+def test_demo_lifecycle_materializes_only_robot_action_abi(
+    monkeypatch,
+    condition,
+    expects_action,
+):
+    client_module = _load_http_client_module(monkeypatch)
+
+    class _Entry:
+        replay = types.SimpleNamespace(sha256="5" * 64)
+
+        def result_metadata(self, **values):
+            return {
+                "evaluation_condition": values["condition"].value,
+                "demo_role": values["condition"].demo_role,
+                "demo_step_count": values["demo_step_count"],
+                "demo_manifest_sha256": values["manifest_sha256"],
+                "replay_sha256": self.replay.sha256,
+                "provenance_sha256": "6" * 64,
+                "source_split": "val_seen",
+                "source_scene_id": "source-scene",
+                "source_episode_id": "source-1",
+                "source_instruction_sha256": "7" * 64,
+                "target_split": "val_seen",
+                "target_scene_id": "data/scene/scene.glb",
+                "target_episode_id": "70",
+                "target_instruction_sha256": "8" * 64,
+                "demo_query_lifecycle_status": values["lifecycle_status"],
+            }
+
+    class _Manifest:
+        sha256 = "4" * 64
+
+        def entry_for(self, **values):
+            assert values == {
+                "split": "val_seen",
+                "scene_id": "data/scene/scene.glb",
+                "episode_id": "70",
+                "instruction": "go forward",
+            }
+            return _Entry()
+
+    class _Replay:
+        step_count = 2
+        entry = _Entry()
+
+        @staticmethod
+        def observation_at(index):
+            return {
+                "instruction": "source instruction",
+                "rgb": np.zeros((2, 2, 3), dtype=np.uint8),
+                "rgb_views": {"front": np.zeros((2, 2, 3), dtype=np.uint8)},
+                "state_xyzyaw": np.zeros(4, dtype=np.float32),
+                "step_id": index,
+                "frame_id": f"frame-{index}",
+            }
+
+        @staticmethod
+        def continuous_action_at(index):
+            assert index in (0, 1)
+            return np.zeros((16, 4), dtype=np.float32) if expects_action else None
+
+    monkeypatch.setattr(
+        client_module,
+        "load_habitat_demonstration_manifest",
+        lambda *args, **kwargs: _Manifest(),
+    )
+    monkeypatch.setattr(
+        client_module,
+        "load_episode_replay",
+        lambda *args, **kwargs: _Replay(),
+    )
+    posted = []
+    chunk = np.zeros((16, 4), dtype=np.float32)
+
+    def fake_post(url, data, headers, timeout):
+        del headers, timeout
+        payload = json_numpy.loads(data)
+        posted.append((url, payload))
+        if url.endswith("/demo"):
+            operation = payload["operation"]
+            response = {"status": "success", "operation": operation}
+            if operation == "ingest":
+                response.update(
+                    {
+                        "demo_role": condition,
+                        "demonstration_steps": sum(
+                            item[1].get("operation") == "ingest" for item in posted
+                        ),
+                    }
+                )
+            return _Response(response)
+        if url.endswith("/episode_end"):
+            return _Response({"status": "success"})
+        return _Response(
+            {
+                "schema_version": 2,
+                "control_mode": "continuous",
+                "stop": False,
+                "action_horizon": 16,
+                "valid_action_dim": 4,
+                "execution_semantics": "canonical_relative_v1",
+                "action_format": "relative_delta_xyzyaw",
+                "action_unit": {"xyz": "m", "yaw": "deg"},
+                "continuous_action": chunk,
+                "chunk_execute_horizon": 1,
+            }
+        )
+
+    monkeypatch.setattr(deploy_client.requests, "post", fake_post)
+    client = client_module.Gr00tTrajectoryClient(
+        "http://policy/act",
+        env_id="habitat-worker-0",
+        evaluation_condition=condition,
+        demonstration_manifest="manifest.json",
+        eval_split="val_seen",
+    )
+    client.reset(
+        "go forward",
+        episode_id="70",
+        scene_id="data/scene/scene.glb",
+    )
+    result = client.query(_observation())
+    client.end_episode(
+        {
+            "termination_kind": "model_stop",
+            "steps": 1,
+            "success": True,
+        }
+    )
+
+    assert result["actions"] == [1]
+    demo_payloads = [payload for url, payload in posted if url.endswith("/demo")]
+    assert [payload["operation"] for payload in demo_payloads] == [
+        "ingest",
+        "ingest",
+        "query_reset",
+    ]
+    assert [payload["request_sequence"] for payload in demo_payloads] == [0, 1, 2]
+    assert all(
+        ("continuous_action" in payload) is expects_action
+        for payload in demo_payloads[:2]
+    )
+    if expects_action:
+        assert all(payload["schema_version"] == 2 for payload in demo_payloads[:2])
+    else:
+        assert all("schema_version" not in payload for payload in demo_payloads[:2])
+    assert client.evaluation_metadata()["demo_query_lifecycle_status"] == "complete"
+    assert client.evaluation_metadata()["target_scene_id"] == "data/scene/scene.glb"
+
+
+def test_partial_demo_failure_releases_client_identity(monkeypatch):
+    client_module = _load_http_client_module(monkeypatch)
+    client = client_module.Gr00tTrajectoryClient(
+        "http://policy/act",
+        env_id="habitat-worker-0",
+    )
+    client._condition = client_module.EvaluationCondition.VIDEO_DEMO
+    client._eval_split = "val_seen"
+    client._manifest = types.SimpleNamespace(entry_for=lambda **kwargs: object())
+    replay = types.SimpleNamespace(
+        step_count=2,
+        entry=types.SimpleNamespace(replay=types.SimpleNamespace(sha256="5" * 64)),
+        observation_at=lambda index: {
+            "instruction": "source",
+            "rgb": np.zeros((2, 2, 3), dtype=np.uint8),
+            "state_xyzyaw": np.zeros(4, dtype=np.float32),
+            "step_id": index,
+        },
+        continuous_action_at=lambda index: None,
+    )
+    monkeypatch.setattr(client_module, "load_episode_replay", lambda *args: replay)
+
+    class _ServerClient:
+        calls = 0
+        ended = False
+
+        def ingest_demonstration(self, *args, **kwargs):
+            self.calls += 1
+            if self.calls == 2:
+                raise RuntimeError("second demo step failed")
+
+        def begin_query(self):
+            raise AssertionError("query reset must not run after partial ingest failure")
+
+        def end_episode(self, **kwargs):
+            assert kwargs["termination_kind"] == "demo_ingest_failed"
+            self.ended = True
+            return {"status": "success"}
+
+    client._server_client = _ServerClient()
+
+    with pytest.raises(RuntimeError, match="second demo step failed"):
+        client.reset(
+            "go forward",
+            episode_id="70",
+            scene_id="data/scene/scene.glb",
+        )
+
+    assert client._server_client.ended is True
     assert client._active_identity is None

@@ -45,6 +45,17 @@ def parse_args():
     # 如果后面habitat这边的数据集和路径什么的要变化，改下面这个文件
     parser.add_argument("--habitat_config_path", type=str, default='scripts/eval/configs/vln_r2r_no_oracle.yaml')
     parser.add_argument("--eval_split", type=str, default='val_unseen')
+    parser.add_argument(
+        "--evaluation_condition",
+        choices=("no_demo", "robot_demo", "video_demo"),
+        default="no_demo",
+    )
+    parser.add_argument(
+        "--demonstration_manifest",
+        type=str,
+        default="",
+        help="Immutable offline replay manifest; required for demo conditions.",
+    )
     parser.add_argument("--output_path", type=str, default='./logs/habitat/test')  #!
     parser.add_argument("--num_future_steps", type=int, default=4)
     parser.add_argument("--num_frames", type=int, default=32)
@@ -142,6 +153,9 @@ def main():
         url=f"http://{args.gr00t_host}:{args.gr00t_port}/act",
         env_id=f"habitat-shard-{args.shard_rank}",
         debug_output_path=os.path.join(args.output_path, "enactive_server_snapshots"),
+        evaluation_condition=args.evaluation_condition,
+        demonstration_manifest=args.demonstration_manifest,
+        eval_split=args.eval_split,
     )
 
     # * 2. initialize evaluator

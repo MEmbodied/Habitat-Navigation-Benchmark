@@ -1,11 +1,8 @@
 #本文件定义了基本类和函数，分为Evaluator（在Habitat中执行）和LLMAgent（调用模型推理）两部分
 import argparse
 import copy
-import itertools
 import json
 import os
-import random
-import re
 from collections import OrderedDict
 from typing import Any, Optional
 
@@ -14,9 +11,7 @@ import numpy as np
 import quaternion
 import torch
 import tqdm
-from depth_camera_filtering import filter_depth
 from habitat import Env
-from habitat.config.default import get_agent_config
 from habitat.config.default_structured_configs import (
     CollisionsMeasurementConfig,
     FogOfWarConfig,
@@ -34,7 +29,6 @@ try:
 except ImportError:
     def to_numpy_array(image):
         return np.asarray(image)
-from internnav.evaluator.ndtw import NDTW
 from internnav.evaluator.episode_plan import (
     load_or_create_episode_plan,
     remaining_episode_keys,
@@ -46,12 +40,9 @@ from dataclasses import dataclass
 from enactive.eval.online.habitat_results import read_result_rows, write_habitat_summary
 
 from internnav.model.utils.vln_utils import (
-    chunk_token,
     image_resize,
     open_image,
     rho_theta,
-    split_and_clean,
-    traj_to_actions,
     traj_to_actions_Gr00t,
 )
 DEFAULT_IMAGE_TOKEN = "<image>"
@@ -330,6 +321,9 @@ class BaseAgent(ABC):
 
     def on_episode_end(self, event: dict):
         pass
+
+    def evaluation_metadata(self) -> dict:
+        return {}
 
 class HabitatSensorAPI:
     def __init__(self, observations, step_id):
@@ -803,6 +797,15 @@ class Evaluator:
             "client_trajectory_xyyaw_m": client_trajectory_xyyaw_m,
         }
         try:
+            end_result = self.agent.on_episode_end(terminal_event)
+            if not isinstance(end_result, dict) or end_result.get("status") != "success":
+                raise RuntimeError(
+                    f"Habitat episode_end returned an invalid response: {end_result!r}"
+                )
+            result.update(self.agent.evaluation_metadata())
+            result["target_init_look_down_steps"] = int(
+                getattr(self.args, "init_look_down_steps", 0)
+            )
             with open(os.path.join(self.output_path, "result.json"), "a") as f:
                 f.write(json.dumps(result) + "\n")
             self._last_result_record = result
@@ -832,11 +835,8 @@ class Evaluator:
                 )
                 print(f"[Eval] episode={episode.episode_id} after_images_to_video", flush=True)
         finally:
-            try:
-                self.agent.on_episode_end(terminal_event)
-            finally:
-                self.vis_frames.clear()
-                self._prev_video_map_coord = None
+            self.vis_frames.clear()
+            self._prev_video_map_coord = None
 
         return metrics
 
@@ -1301,6 +1301,9 @@ class LLMAgent(BaseAgent):
     def on_episode_end(self, event: dict):
         return self.traj_client.end_episode(event)
 
+    def evaluation_metadata(self) -> dict:
+        return self.traj_client.evaluation_metadata()
+
     def _query_trajectory_server(self, request: dict, **kwargs):
         request_payload = dict(request)
         request_payload["executed_actions"] = list(self._executed_actions_since_query)
@@ -1512,7 +1515,7 @@ class LLMAgent(BaseAgent):
             # A. 内部执行两次低头 (Habitat 中低头一次是 30度，原代码通常做两次)
             # 注意：这里的 step 不会增加外部 Evaluator 的 step 计数，因为我们在 Agent 内部
             # 但我们需要从 env 获取新的 observation
-            obs_down_1 = self.env.step(Action.LOOK_DOWN.value)
+            self.env.step(Action.LOOK_DOWN.value)
             self.record_executed_action(Action.LOOK_DOWN.value)
             obs_down_2 = self.env.step(Action.LOOK_DOWN.value) # 这张是地板图
             self.record_executed_action(Action.LOOK_DOWN.value)
