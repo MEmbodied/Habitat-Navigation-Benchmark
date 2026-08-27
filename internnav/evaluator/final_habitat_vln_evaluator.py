@@ -103,16 +103,9 @@ def _metrics_at_threshold(rows: list[dict[str, Any]], threshold_m: float) -> dic
         path_length = _safe_float(row.get("path_length"), float("nan"))
         shortest_path_length = _safe_float(row.get("shortest_path_length"), float("nan"))
         stopped = bool(row.get("stopped", float(row.get("success", 0.0)) > 0.0))
-        row_success_distance = _safe_float(row.get("success_distance"), float("nan"))
-
-        if np.isfinite(row_success_distance) and abs(row_success_distance - threshold_m) < 1e-6:
-            success = _safe_float(row.get("success"), 0.0)
-            oracle_success = _safe_float(row.get("os"), 0.0)
-            spl = _safe_float(row.get("spl"), 0.0)
-        else:
-            success = float(stopped and final_distance <= threshold_m)
-            oracle_success = float(min_distance < threshold_m)
-            spl = _success_weighted_path_length(success, shortest_path_length, path_length)
+        success = float(stopped and final_distance <= threshold_m)
+        oracle_success = float(min_distance <= threshold_m)
+        spl = _success_weighted_path_length(success, shortest_path_length, path_length)
 
         sr_vals.append(success)
         spl_vals.append(spl)
@@ -828,16 +821,9 @@ class Evaluator:
         # ===== episode end =====
         metrics = self.env.get_metrics()
         
-        # ===== evaluator-level metric（和之前完全一致）=====
-        success = metrics["success"]
-        spl = metrics["spl"]
+        # ===== evaluator-level metric =====
         ne = metrics["distance_to_goal"]
-        # print("self.config.habitat.task",self.config.habitat.task)
-        # oracle_success：自己算（等价于你之前的）
         ndtw_score = metrics.get("ndtw", 0.0)
-        oracle_success = float(
-            min_distance < self.config.habitat.task.measurements.success.success_distance
-        )
         stopped = bool(last_action_value == Action.STOP.value)
         termination_kind = (
             "model_stop"
@@ -851,6 +837,10 @@ class Evaluator:
         shortest_path_length = self._episode_shortest_path_length(episode)
         if shortest_path_length is None:
             shortest_path_length = float("nan")
+        success_distance = float(self.config.habitat.task.measurements.success.success_distance)
+        success = float(stopped and ne <= success_distance)
+        oracle_success = float(min_distance <= success_distance)
+        spl = _success_weighted_path_length(success, shortest_path_length, path_length)
 
         self.sucs.append(success)
         self.spls.append(spl)
@@ -868,7 +858,7 @@ class Evaluator:
             "final_distance_to_goal": ne,
             "min_distance": float(min_distance),
             "ndtw": ndtw_score,
-            "success_distance": float(self.config.habitat.task.measurements.success.success_distance),
+            "success_distance": success_distance,
             "path_length": float(path_length),
             "shortest_path_length": float(shortest_path_length),
             "stopped": bool(stopped),
