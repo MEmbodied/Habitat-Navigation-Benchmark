@@ -76,12 +76,10 @@ def test_terminal_release_precedes_completed_result_append():
     assert end_line < result_open_line
 
 
-def test_render_repair_checks_depth_finiteness_without_stepping_environment():
-    depth_calls = _method_calls("_is_corrupt_depth")
+def test_render_repair_is_rgb_only_without_stepping_environment():
     repair_calls = _method_calls("_repair_observation_render")
 
-    assert "np.isfinite" in depth_calls
-    assert "Evaluator._is_corrupt_depth" in repair_calls
+    assert "Evaluator._is_corrupt_depth" not in repair_calls
     assert "self._fresh_sensor_observations" in repair_calls
     assert "self.env.step" not in repair_calls
 
@@ -93,22 +91,18 @@ def test_fresh_sensor_rerender_reapplies_habitat_sensor_transforms():
     assert "self.env.sim.sensor_suite.get_observations" in calls
 
 
-def test_render_repair_replaces_rgb_and_depth_independently():
+def test_render_repair_replaces_only_rgb():
     method = _method("_repair_observation_render")
-    guarded_replacements = set()
+    replaced_fields = set()
     for node in ast.walk(method):
-        if not isinstance(node, ast.If) or not isinstance(node.test, ast.Name):
+        if not isinstance(node, ast.Assign):
             continue
-        for child in ast.walk(ast.Module(body=node.body, type_ignores=[])):
-            if not isinstance(child, ast.Assign):
+        for target in node.targets:
+            if not isinstance(target, ast.Subscript):
                 continue
-            for target in child.targets:
-                if not isinstance(target, ast.Subscript):
-                    continue
-                if not isinstance(target.value, ast.Name) or target.value.id != "repaired":
-                    continue
-                if isinstance(target.slice, ast.Constant) and isinstance(target.slice.value, str):
-                    guarded_replacements.add((node.test.id, target.slice.value))
+            if not isinstance(target.value, ast.Name) or target.value.id != "repaired":
+                continue
+            if isinstance(target.slice, ast.Constant) and isinstance(target.slice.value, str):
+                replaced_fields.add(target.slice.value)
 
-    assert ("repair_rgb", "rgb") in guarded_replacements
-    assert ("repair_depth", "depth") in guarded_replacements
+    assert replaced_fields == {"rgb"}

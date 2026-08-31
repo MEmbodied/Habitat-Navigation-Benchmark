@@ -319,6 +319,27 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
         the server side.  Send an explicit contiguous RGB copy.
         """
         obs_payload = dict(obs)
+        depth = obs_payload.get("depth")
+        if depth is None:
+            obs_payload.pop("depth", None)
+        else:
+            try:
+                depth_array = np.asarray(depth)
+                valid_depth = (
+                    depth_array.size > 0
+                    and np.issubdtype(depth_array.dtype, np.number)
+                    and bool(np.isfinite(depth_array).all())
+                )
+            except (TypeError, ValueError):
+                valid_depth = False
+            if not valid_depth:
+                print(
+                    "[HabitatClient] WARNING: omitting invalid depth from canonical "
+                    f"request episode={obs_payload.get('episode_id', '')} "
+                    f"step={obs_payload.get('step_id', '')}",
+                    flush=True,
+                )
+                obs_payload.pop("depth", None)
         gps = np.asarray(obs_payload["gps"], dtype=np.float32).reshape(-1)
         yaw_rad = float(np.asarray(obs_payload["yaw"]).reshape(-1)[0])
         camera_height = float(np.asarray(obs_payload["camera_height"]).reshape(-1)[0])

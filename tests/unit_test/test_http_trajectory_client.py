@@ -115,6 +115,38 @@ def test_prepare_observation_converts_habitat_coordinates(monkeypatch):
     assert np.allclose(prepared["metrics"]["goal_gps"], [3.0, 1.0])
 
 
+def test_prepare_observation_preserves_finite_depth(monkeypatch):
+    client_module = _load_http_client_module(monkeypatch)
+    client = client_module.Gr00tTrajectoryClient(
+        "http://policy/act",
+        env_id="habitat-worker-0",
+    )
+    depth = np.array([[0.5, 1.0]], dtype=np.float32)
+
+    prepared = client._prepare_observation_payload(_observation(depth=depth))
+
+    assert prepared["depth"] is depth
+
+
+def test_prepare_observation_omits_nonfinite_depth(monkeypatch, capsys):
+    client_module = _load_http_client_module(monkeypatch)
+    client = client_module.Gr00tTrajectoryClient(
+        "http://policy/act",
+        env_id="habitat-worker-0",
+    )
+
+    prepared = client._prepare_observation_payload(
+        _observation(
+            depth=np.array([[0.5, np.nan]], dtype=np.float32),
+            episode_id="episode-7",
+            step_id=23,
+        )
+    )
+
+    assert "depth" not in prepared
+    assert "episode=episode-7 step=23" in capsys.readouterr().out
+
+
 def test_action_response_converts_oracle_goal_to_habitat_coordinates(monkeypatch):
     client_module = _load_http_client_module(monkeypatch)
 

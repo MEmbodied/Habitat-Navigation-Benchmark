@@ -995,27 +995,14 @@ class Evaluator:
         almost_black = float(stats["black_frac"]) > 0.95
         return (hdiff > 50.0 and vdiff > 50.0 and std > 55.0) or purple_like or almost_black
 
-    @staticmethod
-    def _is_corrupt_depth(depth):
-        try:
-            arr = np.asarray(depth)
-            return (
-                arr.size == 0
-                or not np.issubdtype(arr.dtype, np.number)
-                or not bool(np.isfinite(arr).all())
-            )
-        except (TypeError, ValueError):
-            return True
-
     def _repair_observation_render(self, observations, context):
-        """Repair invalid Habitat render buffers without moving the agent.
+        """Repair an invalid Habitat RGB buffer without moving the agent.
 
         A direct sensor re-render at the current pose can replace an invalid RGB
-        or depth entry before the observation reaches the model. Valid entries
-        stay untouched so a depth-only repair cannot change the RGB input, and
-        vice versa.
+        entry before the observation reaches the model. Depth validity is not a
+        render-repair condition because the canonical policy can run without it.
         """
-        if not isinstance(observations, dict):
+        if not isinstance(observations, dict) or "rgb" not in observations:
             return observations
         force_rerender = os.getenv("HABITAT_FORCE_RERENDER_RGB", "0").strip().lower() in {
             "1",
@@ -1023,20 +1010,10 @@ class Evaluator:
             "yes",
             "on",
         }
-        repair_rgb = force_rerender or (
-            "rgb" in observations and Evaluator._is_corrupt_rgb(observations["rgb"])
-        )
-        repair_depth = "depth" not in observations or Evaluator._is_corrupt_depth(
-            observations["depth"]
-        )
-        if not repair_rgb and not repair_depth:
+        if not force_rerender and not Evaluator._is_corrupt_rgb(observations["rgb"]):
             return observations
 
-        before_rgb = (
-            Evaluator._rgb_noise_stats(observations["rgb"])
-            if "rgb" in observations
-            else None
-        )
+        before = Evaluator._rgb_noise_stats(observations["rgb"])
         max_attempts = int(os.getenv("HABITAT_RGB_REPAIR_ATTEMPTS", "8"))
         fail_on_corrupt = os.getenv("HABITAT_FAIL_ON_CORRUPT_RGB", "0").strip().lower() in {
             "1",
@@ -1054,68 +1031,38 @@ class Evaluator:
                 )
                 if attempt < max_attempts:
                     continue
-                if repair_depth or fail_on_corrupt:
+                if fail_on_corrupt:
                     raise RuntimeError(f"Render repair failed at {context}: {exc}") from exc
                 return observations
 
             fresh_rgb = fresh.get("rgb") if isinstance(fresh, dict) else None
-            fresh_depth = fresh.get("depth") if isinstance(fresh, dict) else None
-            rgb_ready = not repair_rgb or (
-                fresh_rgb is not None and not Evaluator._is_corrupt_rgb(fresh_rgb)
-            )
-            depth_ready = not repair_depth or (
-                fresh_depth is not None
-                and not Evaluator._is_corrupt_depth(fresh_depth)
-            )
-            if rgb_ready and depth_ready:
+            if fresh_rgb is not None and not Evaluator._is_corrupt_rgb(fresh_rgb):
                 repaired = dict(observations)
-                if repair_rgb:
-                    repaired["rgb"] = np.ascontiguousarray(
-                        fresh_rgb[..., :3]
-                        if fresh_rgb.ndim == 3 and fresh_rgb.shape[-1] == 4
-                        else fresh_rgb
-                    )
-                if repair_depth:
-                    repaired["depth"] = np.ascontiguousarray(fresh_depth)
-                after_rgb = (
-                    Evaluator._rgb_noise_stats(repaired["rgb"])
-                    if repair_rgb
-                    else before_rgb
+                repaired["rgb"] = np.ascontiguousarray(
+                    fresh_rgb[..., :3]
+                    if fresh_rgb.ndim == 3 and fresh_rgb.shape[-1] == 4
+                    else fresh_rgb
                 )
-                if repair_rgb and repair_depth:
-                    print(
-                        f"[Eval] Repaired corrupt RGB and depth at {context} "
-                        f"on rerender {attempt}: {before_rgb} -> {after_rgb}",
-                        flush=True,
-                    )
-                elif repair_rgb:
-                    label = "Forced RGB rerender" if force_rerender else "Repaired corrupt RGB"
-                    print(
-                        f"[Eval] {label} at {context} on attempt {attempt}: "
-                        f"{before_rgb} -> {after_rgb}",
-                        flush=True,
-                    )
-                else:
-                    print(
-                        f"[Eval] Repaired non-finite depth at {context} "
-                        f"on rerender {attempt}",
-                        flush=True,
-                    )
+                after = Evaluator._rgb_noise_stats(repaired["rgb"])
+                label = "Forced RGB rerender" if force_rerender else "Repaired corrupt RGB"
+                print(
+                    f"[Eval] {label} at {context} on attempt {attempt}: "
+                    f"{before} -> {after}",
+                    flush=True,
+                )
                 return repaired
             print(
-                f"[Eval] Render repair attempt {attempt}/{max_attempts} still invalid "
-                f"at {context}: rgb_ready={rgb_ready} depth_ready={depth_ready}",
+                f"[Eval] RGB repair attempt {attempt}/{max_attempts} still corrupt "
+                f"at {context}: {Evaluator._rgb_noise_stats(fresh_rgb)}",
                 flush=True,
             )
 
         print(
-            f"[Eval] WARNING: Render still invalid after rerender at {context}: "
-            f"rgb={before_rgb} depth_invalid={repair_depth}"
+            f"[Eval] WARNING: RGB still looks corrupt after rerender at {context}: {before}"
         )
-        if repair_depth or fail_on_corrupt:
+        if fail_on_corrupt:
             raise RuntimeError(
-                f"Render still invalid after {max_attempts} rerenders at {context}: "
-                f"rgb={before_rgb} depth_invalid={repair_depth}"
+                f"RGB still corrupt after {max_attempts} rerenders at {context}: {before}"
             )
         return observations
 
