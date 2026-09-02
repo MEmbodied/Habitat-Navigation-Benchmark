@@ -44,6 +44,11 @@ from enum import Enum
 from dataclasses import dataclass
 
 from enactive.eval.online.habitat_results import read_result_rows, write_habitat_summary
+from enactive.dagger.replay_teacher import (
+    REPLAY_TEACHER_LABEL_MODE,
+    ReplayTeacherSession,
+    quaternion_angle_error_deg,
+)
 
 from internnav.model.utils.vln_utils import (
     chunk_token,
@@ -1259,6 +1264,29 @@ class LLMAgent(BaseAgent):
         }
         self.last_action_metadata = {}
         self._executed_actions_since_query = []
+        self._replay_teacher_mode = os.getenv(
+            "HABITAT_DAGGER_TEACHER_MODE", ""
+        ).strip().lower()
+        if self._replay_teacher_mode not in {"", REPLAY_TEACHER_LABEL_MODE}:
+            raise ValueError(
+                "HABITAT_DAGGER_TEACHER_MODE must be empty or "
+                f"{REPLAY_TEACHER_LABEL_MODE!r}"
+            )
+        self._replay_teacher = (
+            ReplayTeacherSession(
+                gpu_device_id=int(getattr(args, "sim_gpu", 0)),
+                target_path_length_m=float(
+                    os.getenv("ENACTIVE_DAGGER_TARGET_PATH_LENGTH_M", "1.5")
+                ),
+                waypoint_radius_m=float(
+                    os.getenv("HABITAT_DAGGER_TEACHER_WAYPOINT_RADIUS_M", "0.5")
+                ),
+                max_steps=int(os.getenv("HABITAT_DAGGER_TEACHER_MAX_STEPS", "128")),
+            )
+            if self._replay_teacher_mode == REPLAY_TEACHER_LABEL_MODE
+            else None
+        )
+        self._replay_teacher_progress_index = 0
 
     def set_env(self, env):
         self.env = env
@@ -1292,6 +1320,7 @@ class LLMAgent(BaseAgent):
         self._dagger_oracle_follower = None
         self.last_action_metadata = {}
         self._executed_actions_since_query = []
+        self._replay_teacher_progress_index = 0
 
         self.last_pixel_goal = None
 
@@ -1301,8 +1330,67 @@ class LLMAgent(BaseAgent):
     def on_episode_end(self, event: dict):
         return self.traj_client.end_episode(event)
 
+    @staticmethod
+    def _agent_state_xyzw(state):
+        from habitat_sim.utils.common import quat_to_coeffs
+
+        return (
+            np.asarray(state.position, dtype=np.float32).reshape(3),
+            np.asarray(quat_to_coeffs(state.rotation), dtype=np.float32).reshape(4),
+        )
+
+    def _build_replay_teacher_payload(self):
+        if self._replay_teacher is None:
+            return None
+        if self.env is None:
+            raise RuntimeError("shadow replay teacher requires the active Habitat environment")
+        episode = getattr(self.env, "current_episode", None)
+        if episode is None:
+            raise RuntimeError("shadow replay teacher requires the active Habitat episode")
+
+        reference = np.asarray(getattr(episode, "reference_path", None), dtype=np.float32)
+        goals = list(getattr(episode, "goals", []) or [])
+        goal = goals[0] if goals else None
+        goal_position = (
+            goal.get("position") if isinstance(goal, dict)
+            else getattr(goal, "position", None)
+        )
+        if goal_position is None:
+            raise RuntimeError("shadow replay teacher requires an official episode goal")
+        scene_path = getattr(self.env.sim, "_current_scene", None)
+        if not scene_path or not os.path.isfile(str(scene_path)):
+            raise RuntimeError(
+                f"shadow replay teacher cannot resolve the active scene: {scene_path!r}"
+            )
+
+        before_state = self.env.sim.get_agent_state()
+        before_position, before_rotation = self._agent_state_xyzw(before_state)
+        payload = self._replay_teacher.rollout(
+            scene_path=scene_path,
+            episode_start_position=getattr(episode, "start_position"),
+            episode_start_rotation_xyzw=getattr(episode, "start_rotation"),
+            reference_path_world=reference,
+            goal_world=goal_position,
+            student_position_world=before_position,
+            student_rotation_world_xyzw=before_rotation,
+            progress_index=self._replay_teacher_progress_index,
+        )
+        after_state = self.env.sim.get_agent_state()
+        after_position, after_rotation = self._agent_state_xyzw(after_state)
+        payload["main_pose_position_error_m"] = float(
+            np.linalg.norm(after_position - before_position)
+        )
+        payload["main_pose_rotation_error_deg"] = quaternion_angle_error_deg(
+            after_rotation, before_rotation
+        )
+        self._replay_teacher_progress_index = int(payload["progress_index"])
+        return payload
+
     def _query_trajectory_server(self, request: dict, **kwargs):
         request_payload = dict(request)
+        teacher_payload = self._build_replay_teacher_payload()
+        if teacher_payload is not None:
+            request_payload["dagger_teacher_rollout"] = teacher_payload
         request_payload["executed_actions"] = list(self._executed_actions_since_query)
         response = self.traj_client.query(request_payload, **kwargs)
         self._executed_actions_since_query.clear()
