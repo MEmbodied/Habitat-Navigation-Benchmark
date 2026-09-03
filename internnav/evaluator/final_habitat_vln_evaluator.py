@@ -476,7 +476,7 @@ class Evaluator:
         self.agent = agent
         self.max_steps = max_steps
         self.output_path = output_path
-        self.save_video = args.save_video and os.getenv("HABITAT_DISABLE_VIDEO_RENDER", "0") != "1"
+        self.save_snapshots = bool(args.save_snapshots)
         self.init_look_down_steps = max(0, int(getattr(args, "init_look_down_steps", 2)))
         self.vis_frames = []
         self._prev_video_map_coord = None
@@ -706,14 +706,15 @@ class Evaluator:
             )
             current_dist = self.env.get_metrics().get("distance_to_goal", float("inf"))
             current_metrics = self.env.get_metrics()
-            self._write_step_metrics(
-                episode=episode,
-                episode_instruction=episode_instruction,
-                step=step,
-                metrics=current_metrics,
-                min_distance=min(min_distance, current_dist),
-                path_length=path_length,
-            )
+            if self.save_snapshots:
+                self._write_step_metrics(
+                    episode=episode,
+                    episode_instruction=episode_instruction,
+                    step=step,
+                    metrics=current_metrics,
+                    min_distance=min(min_distance, current_dist),
+                    path_length=path_length,
+                )
             print(
                 f"[EvalStep] episode={episode.episode_id} step={step} after_get_metrics",
                 flush=True,
@@ -721,7 +722,7 @@ class Evaluator:
             if current_dist < min_distance:
                 min_distance = current_dist
 
-            if self.save_video:
+            if self.save_snapshots:
                 print(
                     f"[EvalStep] episode={episode.episode_id} step={step} before_observations_to_image",
                     flush=True,
@@ -818,7 +819,7 @@ class Evaluator:
                 f"result.json updated"
             )
 
-            if self.save_video and len(self.vis_frames) > 0:
+            if self.save_snapshots and len(self.vis_frames) > 0:
                 print(f"[Eval] episode={episode.episode_id} before_images_to_video", flush=True)
                 scene_id = episode.scene_id.split("/")[-2]
                 save_dir = os.path.join(

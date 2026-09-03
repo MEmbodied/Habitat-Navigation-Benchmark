@@ -10,7 +10,7 @@ uvicorn InternNav.scripts.eval.server_Gr00t:app \
     --host 127.0.0.1 \
     --port 9000
 2.接着运行：
-python scripts/eval/eval_main.py --model_path /data/sjh/GR00T-Internva/output_uav/checkpoint-300000 --continuous_traj --output_path result/Gr00t/val_unseen_32traj_8steps --save_video
+python scripts/eval/eval_main.py --model_path /data/sjh/GR00T-Internva/output_uav/checkpoint-300000 --continuous_traj --output_path result/Gr00t/val_unseen_32traj_8steps --save-snapshots
 
 ## Enactive HTTP action contract
 

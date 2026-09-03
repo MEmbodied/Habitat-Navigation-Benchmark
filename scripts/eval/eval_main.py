@@ -48,8 +48,11 @@ def parse_args():
     parser.add_argument("--output_path", type=str, default='./logs/habitat/test')  #!
     parser.add_argument("--num_future_steps", type=int, default=4)
     parser.add_argument("--num_frames", type=int, default=32)
-    parser.add_argument("--save_video", dest="save_video", action="store_true", default=True)
-    parser.add_argument("--no_save_video", dest="save_video", action="store_false")
+    parser.add_argument(
+        "--save-snapshots",
+        action="store_true",
+        help="Save detailed, non-essential per-step metrics and episode videos.",
+    )
     parser.add_argument("--num_history", type=int, default=8)
     parser.add_argument(
         "--init_look_down_steps",
