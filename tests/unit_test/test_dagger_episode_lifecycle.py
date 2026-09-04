@@ -14,6 +14,7 @@ from internnav.evaluator.dagger_lifecycle import DaggerEpisodeAbort  # noqa: E40
 from internnav.evaluator.final_habitat_vln_evaluator import (  # noqa: E402
     Action,
     Evaluator,
+    LLMAgent,
 )
 
 
@@ -135,3 +136,47 @@ def test_teacher_unavailable_aborts_one_episode_then_next_episode_runs(tmp_path)
         "model_stop",
     ]
     assert evaluator.env.step_count == 1
+
+
+class _StopFollower:
+    def get_next_action(self, goal) -> int:
+        del goal
+        return Action.STOP.value
+
+
+def _oracle_agent(distance: float) -> LLMAgent:
+    agent = object.__new__(LLMAgent)
+    agent._dagger_oracle_goal_world = np.asarray([1.0, 0.0, 0.0], dtype=np.float32)
+    agent._dagger_oracle_goal_index = 1
+    agent._dagger_oracle_remaining = 8
+    agent._dagger_oracle_phase = "rejoin"
+    agent._dagger_oracle_source = "dagger"
+    agent._dagger_oracle_follower = _StopFollower()
+    agent._dagger_oracle_goal_radius_m = 0.35
+    agent.env = SimpleNamespace(
+        sim=SimpleNamespace(
+            get_agent_state=lambda: SimpleNamespace(
+                position=np.asarray([0.0, 0.0, 0.0], dtype=np.float32)
+            ),
+            geodesic_distance=lambda start, goal: distance,
+        )
+    )
+    return agent
+
+
+def test_native_oracle_stop_uses_habitat_sim_geodesic_distance() -> None:
+    agent = _oracle_agent(0.2)
+
+    assert agent._next_dagger_oracle_action() is None
+    assert agent._dagger_oracle_follower is None
+
+
+def test_native_oracle_false_stop_aborts_dagger_episode() -> None:
+    agent = _oracle_agent(1.0)
+
+    try:
+        agent._next_dagger_oracle_action()
+    except DaggerEpisodeAbort as exc:
+        assert str(exc).startswith("native_oracle_false_reached:")
+    else:
+        raise AssertionError("far native-oracle STOP must abort the DAgger episode")

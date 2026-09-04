@@ -1546,7 +1546,7 @@ class LLMAgent(BaseAgent):
                 self.env.sim.get_agent_state().position, dtype=np.float32
             )
             distance = float(
-                self.env.sim.pathfinder.geodesic_distance(
+                self.env.sim.geodesic_distance(
                     position, self._dagger_oracle_goal_world
                 )
             )
