@@ -374,3 +374,28 @@ def test_episode_end_retries_identical_payload_after_lost_response(monkeypatch):
     assert len(posted) == 2
     assert posted[0] == posted[1]
     assert client._active_identity is None
+
+
+def test_dagger_abort_response_raises_only_episode_local_signal(monkeypatch):
+    client_module = _load_http_client_module(monkeypatch)
+
+    monkeypatch.setattr(
+        client_module.requests,
+        "post",
+        lambda *args, **kwargs: _Response(
+            {
+                "dagger_abort_episode": True,
+                "dagger_failure_type": "habitat_replay_teacher_unavailable_target",
+                "continuous_action": np.zeros((16, 4), dtype=np.float32),
+            }
+        ),
+    )
+    client = _client(client_module)
+
+    with pytest.raises(
+        client_module.DaggerEpisodeAbort,
+        match="habitat_replay_teacher_unavailable_target",
+    ):
+        client.query(_observation())
+
+    assert client._active_identity is not None

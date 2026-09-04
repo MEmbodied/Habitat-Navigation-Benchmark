@@ -10,6 +10,7 @@ from collections import OrderedDict
 from typing import Any, Optional
 
 import habitat
+import habitat_sim
 import numpy as np
 import quaternion
 import torch
@@ -39,6 +40,7 @@ from internnav.evaluator.episode_plan import (
     load_or_create_episode_plan,
     remaining_episode_keys,
 )
+from internnav.evaluator.dagger_lifecycle import DaggerEpisodeAbort
 from abc import ABC, abstractmethod
 from enum import Enum
 from dataclasses import dataclass
@@ -643,6 +645,7 @@ class Evaluator:
         path_length = 0.0
         prev_position = np.asarray(self.env.sim.get_agent_state().position, dtype=np.float64)
         last_action_value = None
+        abort_reason = None
         client_trajectory_xyyaw_m = [
             self._model_pose_xyyaw(observations)
         ]
@@ -660,7 +663,16 @@ class Evaluator:
             )
 
             # === 模块 5（之后）：Observation → Action ===
-            action = self.agent.act(obs)
+            try:
+                action = self.agent.act(obs)
+            except DaggerEpisodeAbort as exc:
+                abort_reason = exc.reason
+                print(
+                    f"[Eval] episode={episode.episode_id} accepted teacher unavailable: "
+                    f"{abort_reason}",
+                    flush=True,
+                )
+                break
             action_vis = self._agent_action_vis_metadata()
             before_metrics = self.env.get_metrics()
             prev_map_coord = self._current_map_coord(before_metrics)
@@ -748,8 +760,8 @@ class Evaluator:
         metrics = self.env.get_metrics()
         
         # ===== evaluator-level metric（和之前完全一致）=====
-        success = metrics["success"]
-        spl = metrics["spl"]
+        success = 0.0 if abort_reason is not None else metrics["success"]
+        spl = 0.0 if abort_reason is not None else metrics["spl"]
         ne = metrics["distance_to_goal"]
         # print("self.config.habitat.task",self.config.habitat.task)
         # oracle_success：自己算（等价于你之前的）
@@ -759,7 +771,9 @@ class Evaluator:
         )
         stopped = bool(last_action_value == Action.STOP.value)
         termination_kind = (
-            "model_stop"
+            "accepted_teacher_unavailable"
+            if abort_reason is not None
+            else "model_stop"
             if stopped
             else "budget_exhausted"
             if step >= self.max_steps and not self.env.episode_over
@@ -790,6 +804,7 @@ class Evaluator:
             "last_action": int(last_action_value) if last_action_value is not None else None,
             "steps": step,
             "termination_kind": termination_kind,
+            "termination_reason": abort_reason or termination_kind,
             "episode_instruction": episode_instruction,
             "dataset_episode_instruction": (
                 episode.instruction.instruction_text
@@ -803,7 +818,7 @@ class Evaluator:
             "episode_id": str(episode.episode_id),
             "scene_id": str(episode.scene_id),
             "termination_kind": termination_kind,
-            "termination_reason": termination_kind,
+            "termination_reason": abort_reason or termination_kind,
             "steps": int(step),
             "success": bool(success),
             "client_trajectory_xyyaw_m": client_trajectory_xyyaw_m,
@@ -1257,6 +1272,7 @@ class LLMAgent(BaseAgent):
         self._dagger_oracle_phase = None
         self._dagger_oracle_source = "dagger"
         self._dagger_oracle_follower = None
+        self._dagger_oracle_goal_radius_m = None
         self._query_server_during_oracle = os.getenv("HABITAT_QUERY_SERVER_DURING_ORACLE", "0").strip().lower() in {
             "1",
             "true",
@@ -1319,6 +1335,7 @@ class LLMAgent(BaseAgent):
         self._dagger_oracle_phase = None
         self._dagger_oracle_source = "dagger"
         self._dagger_oracle_follower = None
+        self._dagger_oracle_goal_radius_m = None
         self.last_action_metadata = {}
         self._executed_actions_since_query = []
         self._replay_teacher_progress_index = 0
@@ -1453,12 +1470,16 @@ class LLMAgent(BaseAgent):
             self._dagger_oracle_phase = None
             self._dagger_oracle_source = "dagger"
             self._dagger_oracle_follower = None
+            self._dagger_oracle_goal_radius_m = None
+            if not action_response.get("eval_gt_low_policy"):
+                raise DaggerEpisodeAbort("native_oracle_goal_conversion_failed")
             return
         radius = float(action_response.get("oracle_goal_radius", 0.35))
         self._dagger_oracle_source = "eval_gt_low_policy" if action_response.get("eval_gt_low_policy") else "dagger"
         self._dagger_oracle_goal_world = np.asarray(goal_world, dtype=np.float32)
         self._dagger_oracle_goal_index = int(goal_index) if goal_index is not None else None
         self._dagger_oracle_remaining = int(action_response.get("oracle_max_steps", 80))
+        self._dagger_oracle_goal_radius_m = radius
         self._dagger_oracle_phase = "rejoin"
         self._dagger_oracle_follower = ShortestPathFollower(self.env.sim, radius, False)
         print(
@@ -1479,6 +1500,7 @@ class LLMAgent(BaseAgent):
         self._dagger_oracle_phase = None
         self._dagger_oracle_source = "dagger"
         self._dagger_oracle_follower = None
+        self._dagger_oracle_goal_radius_m = None
 
     def _oracle_log_label(self) -> str:
         if getattr(self, "_dagger_oracle_source", "") == "eval_gt_low_policy":
@@ -1497,16 +1519,49 @@ class LLMAgent(BaseAgent):
         }
 
     def _next_dagger_oracle_action(self):
-        if (
-            self._dagger_oracle_goal_world is None
-            or self._dagger_oracle_follower is None
-            or self._dagger_oracle_remaining <= 0
-        ):
+        if self._dagger_oracle_goal_world is None or self._dagger_oracle_follower is None:
             self._reset_dagger_oracle()
             return None
-        action = self._dagger_oracle_follower.get_next_action(self._dagger_oracle_goal_world)
+        if self._dagger_oracle_remaining <= 0:
+            source = self._dagger_oracle_source
+            self._reset_dagger_oracle()
+            if source == "dagger":
+                raise DaggerEpisodeAbort("native_oracle_budget_exhausted")
+            return None
+        try:
+            action = self._dagger_oracle_follower.get_next_action(
+                self._dagger_oracle_goal_world
+            )
+        except habitat_sim.errors.GreedyFollowerError as exc:
+            source = self._dagger_oracle_source
+            self._reset_dagger_oracle()
+            if source == "dagger":
+                raise DaggerEpisodeAbort(
+                    f"native_oracle_greedy_follower_error:{type(exc).__name__}"
+                ) from exc
+            raise
         if action is None or int(action) == Action.STOP.value:
             phase = self._dagger_oracle_phase or "rejoin"
+            position = np.asarray(
+                self.env.sim.get_agent_state().position, dtype=np.float32
+            )
+            distance = float(
+                self.env.sim.pathfinder.geodesic_distance(
+                    position, self._dagger_oracle_goal_world
+                )
+            )
+            radius = float(self._dagger_oracle_goal_radius_m or 0.0)
+            source = self._dagger_oracle_source
+            if not np.isfinite(distance) or distance > radius + 1e-4:
+                self._reset_dagger_oracle()
+                if source == "dagger":
+                    raise DaggerEpisodeAbort(
+                        "native_oracle_false_reached:"
+                        f"geodesic={distance}:radius={radius}"
+                    )
+                raise RuntimeError(
+                    "Habitat native oracle returned STOP outside its goal radius"
+                )
             print(f"[LLMAgent] {self._oracle_log_label()} {phase} target reached")
             self._reset_dagger_oracle()
             return None

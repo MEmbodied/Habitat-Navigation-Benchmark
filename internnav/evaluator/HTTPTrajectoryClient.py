@@ -20,6 +20,7 @@ from internnav.evaluator.canonical_action import (
     CLIENT_CAPABILITIES,
     habitat_actions_from_response,
 )
+from internnav.evaluator.dagger_lifecycle import DaggerEpisodeAbort
 
 json_numpy.patch()
 
@@ -51,6 +52,7 @@ _RESPONSE_METADATA_KEYS = (
     "dagger_teacher_actions_discrete",
     "dagger_final_actions_discrete",
     "dagger_correction_applied",
+    "dagger_abort_episode",
 )
 
 
@@ -367,6 +369,10 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
                 raise ValueError(f"unexpected /act response: {type(result)!r}")
             if result.get("error"):
                 raise RuntimeError(f"policy server rejected observation: {result['error']}")
+            if bool(result.get("dagger_abort_episode", False)):
+                raise DaggerEpisodeAbort(
+                    str(result.get("dagger_failure_type") or "teacher_unavailable")
+                )
             if not bool(result.get("replan_required", False)):
                 break
             if replan_rounds >= _MAX_REPLAN_ROUNDS:
